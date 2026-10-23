@@ -168,13 +168,25 @@ def optimize_collateral_vs_delay(
     - Repo pledge cost: pledging C Crores of collateral with haircut h costs
       C * (repo_rate_bps_per_day / 100.0) / (1 - h) Lakhs per day in opportunity & encumbering cost.
     - Payment delay / gridlock penalty cost: each unsettled/delayed Crore incurs priority-weighted
-      SLA/regulatory delay cost per hour (URGT: 4.5 bps/hr, HIGH: 2.5 bps/hr, NORM: 1.2 bps/hr).
+      SLA/regulatory delay cost per hour (URGT: 4.5 bps/hr, HIGH: 2.5 bps/hr, NORM: 1.2 bps/hr)
+      from its arrival hour to 18:00, at least 2 hours.
+    - Naive full prefunding: pledge enough collateral that every bank can fund all of its gross
+      outflows from its own buffer, so everything settles with no delay.
+    All rates are illustrative assumptions, not calibrated to any market.
     """
     delay_cost_bps = {"URGT": 4.5, "HIGH": 2.5, "NORM": 1.2}
     haircut_frac = min(0.85, max(0.0, collateral_haircut_pct / 100.0))
     effective_multiplier = 1.0 - haircut_frac
 
-    total_vol = sum(p.amount for p in payments)
+    def repo_cost(pledge_cr: float) -> float:
+        return pledge_cr * (repo_rate_bps_per_day / 100.0) / max(effective_multiplier, 0.25)
+
+    def delay_cost(unsettled: List[QueuedPayment]) -> float:
+        # One formula for every strategy, so the comparison is like for like
+        return sum(
+            p.amount * (delay_cost_bps[p.priority] / 100.0) * max(2.0, 18.0 - _parse_hour(p.timestamp))
+            for p in unsettled
+        )
 
     # Evaluate candidate collateral pledges (system-wide extra repo pledge in Crores)
     candidate_pledges = [0.0, 25.0, 50.0, 80.0, 120.0, 160.0, 220.0, 300.0, 450.0, 650.0]
@@ -184,17 +196,15 @@ def optimize_collateral_vs_delay(
 
     # 1. Baseline unoptimized cost (FIFO without extra collateral pledge)
     fifo_zero = settle_fifo(banks, payments)
-    unoptimized_delay_cost_lakhs = sum(
-        p.amount
-        * (delay_cost_bps[p.priority] / 100.0)
-        * max(2.0, 18.0 - _parse_hour(p.timestamp))
-        for p in fifo_zero.unsettled_payments
-    )
+    unoptimized_delay_cost_lakhs = delay_cost(fifo_zero.unsettled_payments)
 
-    # 2. Naive full gross prefunding (pledging 55% of total gross volume to clear without LSM)
-    naive_pledge_cr = round(total_vol * 0.45 / max(effective_multiplier, 0.2), 2)
-    naive_repo_cost_lakhs = naive_pledge_cr * (repo_rate_bps_per_day / 100.0) * 2.2
-    naive_total_cost_lakhs = naive_repo_cost_lakhs + 1.5  # minimal operational friction
+    # 2. Naive full gross prefunding: cover each bank's gross outflows beyond its free buffer
+    shortfall_cr = sum(
+        max(0.0, sum(p.amount for p in payments if p.sender == b.bic) - b.available_liquidity)
+        for b in banks
+    )
+    naive_pledge_cr = shortfall_cr / max(effective_multiplier, 0.15)
+    naive_total_cost_lakhs = repo_cost(naive_pledge_cr)
 
     n_banks = max(1, len(banks))
     for pledge_cr in candidate_pledges:
@@ -211,15 +221,8 @@ def optimize_collateral_vs_delay(
         ]
         lsm_res = settle_multilateral_lsm(boosted_banks, payments)
 
-        repo_cost_lakhs = (
-            pledge_cr * (repo_rate_bps_per_day / 100.0) / max(effective_multiplier, 0.25)
-        )
-        delay_cost_lakhs = sum(
-            p.amount
-            * (delay_cost_bps[p.priority] / 100.0)
-            * max(1.5, 18.0 - _parse_hour(p.timestamp))
-            for p in lsm_res.unsettled_payments
-        )
+        repo_cost_lakhs = repo_cost(pledge_cr)
+        delay_cost_lakhs = delay_cost(lsm_res.unsettled_payments)
         total_cost_lakhs = repo_cost_lakhs + delay_cost_lakhs
 
         point = {
