@@ -330,3 +330,20 @@ def test_engines_reject_inputs_they_would_misaccount() -> None:
         QueuedPayment("T", a, b, 5.0, timestamp="yesterday")
     with pytest.raises(ValueError):
         BankNode(a, "A", float("inf"), 0.0)
+
+
+def test_parser_rejects_bad_amounts_dtds_and_missing_currency() -> None:
+    good = generate_pacs008_xml(
+        ISO20022Payment("M1", "E1", "SBININBBXXX", "HDFCINBBXXX", 10.0, settlement_timestamp="2026-10-22T09:15:00Z")
+    )
+    assert parse_iso20022_xml(good).amount == pytest.approx(10.0)
+    for bad_amount in ("nan", "inf", "1e308", "-5.00", "10.123456"):
+        with pytest.raises(ISO20022ValidationError):
+            parse_iso20022_xml(good.replace(">10.00<", f">{bad_amount}<"))
+    with pytest.raises(ISO20022ValidationError):
+        parse_iso20022_xml(good.replace(' Ccy="INR"', ""))
+    with pytest.raises(ISO20022ValidationError):
+        parse_iso20022_xml(good.replace("2026-10-22T09:15:00Z", "yesterday"))
+    bomb = '<?xml version="1.0"?><!DOCTYPE d [<!ENTITY a "aaaa">]><Document>&a;</Document>'
+    with pytest.raises(ISO20022ValidationError):
+        parse_iso20022_xml(bomb)

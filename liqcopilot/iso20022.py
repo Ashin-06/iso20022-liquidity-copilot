@@ -9,6 +9,7 @@ Supports:
 
 from __future__ import annotations
 
+import math
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -28,6 +29,11 @@ VALID_MSG_TYPES = set(NAMESPACES.keys())
 BIC_REGEX = re.compile(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$")
 # Indian RTGS/NEFT IFSC (11 characters: 4 alpha bank code + '0' + 6 alphanumeric branch code)
 IFSC_REGEX = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
+# ActiveCurrencyAndAmount: at most 18 digits, 5 of them after the point; no sign, exponent, NaN or inf
+AMOUNT_REGEX = re.compile(r"^\d{1,13}(\.\d{1,5})?$")
+CURRENCY_REGEX = re.compile(r"^[A-Z]{3}$")
+MAX35 = 35  # Max35Text: MsgId, EndToEndId, InstrId, TxId
+MAX_XML_CHARS = 200_000
 
 
 class ISO20022ValidationError(ValueError):
@@ -77,10 +83,10 @@ def validate_iso20022_payment(payment: ISO20022Payment) -> None:
         raise ISO20022ValidationError(
             f"Unsupported msg_type '{payment.msg_type}'. Must be one of {sorted(VALID_MSG_TYPES)}."
         )
-    if not payment.msg_id or not payment.msg_id.strip():
-        raise ISO20022ValidationError("MsgId must be non-empty.")
-    if not payment.end_to_end_id or not payment.end_to_end_id.strip():
-        raise ISO20022ValidationError("EndToEndId must be non-empty.")
+    if not payment.msg_id or not payment.msg_id.strip() or len(payment.msg_id) > MAX35:
+        raise ISO20022ValidationError("MsgId must be 1-35 characters.")
+    if not payment.end_to_end_id or not payment.end_to_end_id.strip() or len(payment.end_to_end_id) > MAX35:
+        raise ISO20022ValidationError("EndToEndId must be 1-35 characters.")
 
     debtor = validate_bic_or_ifsc(payment.debtor_agent)
     creditor = validate_bic_or_ifsc(payment.creditor_agent)
@@ -91,16 +97,21 @@ def validate_iso20022_payment(payment: ISO20022Payment) -> None:
     payment.debtor_agent = debtor
     payment.creditor_agent = creditor
 
-    if not isinstance(payment.amount, (int, float)) or payment.amount <= 0:
+    if (
+        not isinstance(payment.amount, (int, float))
+        or not math.isfinite(payment.amount)
+        or payment.amount <= 0
+    ):
         raise ISO20022ValidationError(
             f"Settlement amount must be strictly positive (got {payment.amount})."
         )
 
-    if not payment.currency or len(payment.currency.strip()) != 3:
+    currency = (payment.currency or "").strip().upper()
+    if not CURRENCY_REGEX.match(currency):
         raise ISO20022ValidationError(
             f"Currency must be a 3-letter ISO 4217 code (got '{payment.currency}')."
         )
-    payment.currency = payment.currency.strip().upper()
+    payment.currency = currency
 
     priority = payment.priority.strip().upper() if payment.priority else ""
     if priority not in VALID_PRIORITIES:
@@ -109,8 +120,23 @@ def validate_iso20022_payment(payment: ISO20022Payment) -> None:
         )
     payment.priority = priority
 
-    if not payment.settlement_timestamp or not payment.settlement_timestamp.strip():
-        raise ISO20022ValidationError("Settlement timestamp must be non-empty.")
+    try:
+        datetime.fromisoformat(payment.settlement_timestamp.strip())
+    except (AttributeError, ValueError) as exc:
+        raise ISO20022ValidationError(
+            f"Settlement timestamp must be an ISO 8601 date-time (got '{payment.settlement_timestamp}')."
+        ) from exc
+
+
+def _parse_amount(elem: ET.Element) -> tuple[float, str]:
+    """Read an ActiveCurrencyAndAmount element; the Ccy attribute is mandatory."""
+    text = (elem.text or "").strip()
+    if not AMOUNT_REGEX.match(text):
+        raise ISO20022ValidationError(f"Invalid amount '{elem.text}': expected digits with up to 5 decimals.")
+    currency = elem.attrib.get("Ccy")
+    if not currency:
+        raise ISO20022ValidationError(f"Amount element {_strip_ns(elem.tag)} is missing its Ccy attribute.")
+    return float(text), currency
 
 
 def _strip_ns(tag: str) -> str:
@@ -300,7 +326,7 @@ def generate_camt054_xml(
     ET.SubElement(grp_hdr, "CreDtTm").text = payment.settlement_timestamp
 
     ntfctn = ET.SubElement(root, "Ntfctn")
-    ET.SubElement(ntfctn, "Id").text = f"NTF-{payment.msg_id}"
+    ET.SubElement(ntfctn, "Id").text = f"NTF-{payment.msg_id}"[:MAX35]
     ET.SubElement(ntfctn, "CreDtTm").text = payment.settlement_timestamp
 
     acct = ET.SubElement(ntfctn, "Acct")
@@ -353,6 +379,11 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
     """Parse and validate an ISO 20022 XML document (pacs.008, pacs.009, or camt.054)."""
     if not xml_str or not isinstance(xml_str, str) or not xml_str.strip():
         raise ISO20022ValidationError("Empty XML string provided.")
+    if len(xml_str) > MAX_XML_CHARS:
+        raise ISO20022ValidationError(f"XML document is over {MAX_XML_CHARS} characters.")
+    # ISO 20022 messages never carry a DTD; refusing one rules out entity-expansion tricks
+    if "<!DOCTYPE" in xml_str or "<!ENTITY" in xml_str:
+        raise ISO20022ValidationError("DOCTYPE and ENTITY declarations are not allowed.")
 
     try:
         doc = ET.fromstring(xml_str.strip())
@@ -395,17 +426,11 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
         priority = _find_first_text(tx, ["PmtTpInf", "InstrPrty"]) or "NORM"
 
         amt_elem = _find_first_elem(tx, ["IntrBkSttlmAmt"])
-        if amt_elem is None or not amt_elem.text:
+        if amt_elem is None:
             raise ISO20022ValidationError(
                 f"Missing IntrBkSttlmAmt element in {expected_type}."
             )
-        try:
-            amount = float(amt_elem.text.strip())
-        except ValueError as exc:
-            raise ISO20022ValidationError(
-                f"Non-numeric IntrBkSttlmAmt '{amt_elem.text}'."
-            ) from exc
-        currency = amt_elem.attrib.get("Ccy", "INR")
+        amount, currency = _parse_amount(amt_elem)
 
         dbtr_agt_el = _find_first_elem(tx, ["DbtrAgt"])
         if dbtr_agt_el is None:
@@ -460,13 +485,9 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
             raise ISO20022ValidationError("Missing Ntfctn/Ntry in camt.054.001.08.")
 
         amt_elem = _find_first_elem(ntry, ["Amt"])
-        if amt_elem is None or not amt_elem.text:
+        if amt_elem is None:
             raise ISO20022ValidationError("Missing Ntry/Amt in camt.054.001.08.")
-        try:
-            amount = float(amt_elem.text.strip())
-        except ValueError as exc:
-            raise ISO20022ValidationError(f"Non-numeric Amt '{amt_elem.text}'.") from exc
-        currency = amt_elem.attrib.get("Ccy", "INR")
+        amount, currency = _parse_amount(amt_elem)
         cdt_dbt = _find_first_text(ntry, ["CdtDbtInd"]) or "CRDT"
         status = (
             _find_first_text(ntry, ["Sts", "Cd"])
