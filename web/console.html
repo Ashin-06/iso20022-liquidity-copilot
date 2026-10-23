@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ISO 20022 RTGS Liquidity Copilot — BCBS 248 & Multilateral LSM</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #131b33;
+      --border: #25335a;
+      --accent: #38bdf8;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      line-height: 1.5;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+    }
+    h1 { font-size: 1.45rem; font-weight: 700; color: #fff; }
+    .badge {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+    }
+    .card h2 {
+      font-size: 1.05rem;
+      margin-bottom: 12px;
+      color: var(--accent);
+    }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .kpi {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .kpi .val { font-size: 1.4rem; font-weight: 700; color: var(--green); }
+    .kpi .lbl { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
+    select, button, textarea, input {
+      background: #0d1428;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 0.88rem;
+    }
+    button {
+      background: var(--accent);
+      color: #091024;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      margin-right: 8px;
+    }
+    button:hover { opacity: 0.9; }
+    pre {
+      background: #070b17;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      overflow-x: auto;
+      font-size: 0.78rem;
+      color: #a5f3fc;
+      max-height: 290px;
+      margin-top: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      margin-top: 10px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 6px;
+      text-align: left;
+    }
+    th { color: var(--muted); font-weight: 600; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>ISO 20022 RTGS Liquidity Copilot & Intraday Gridlock Resolver</h1>
+      <p style="color: var(--muted); font-size: 0.88rem;">
+        pacs.008 / pacs.009 / camt.054 XML Engine • Multilateral Cycle-Netting LSM • Basel III BCBS 248 Stress Simulator
+      </p>
+    </div>
+    <span class="badge">PORT 8013 • RTGS LIVE</span>
+  </header>
+
+  <div class="kpi-row">
+    <div class="kpi">
+      <div class="val" id="kpi-lsm">--%</div>
+      <div class="lbl">Multilateral LSM Volume Cleared (&gt;85%)</div>
+    </div>
+    <div class="kpi">
+      <div class="val" id="kpi-fifo" style="color: var(--amber);">--%</div>
+      <div class="lbl">FIFO Gross Volume Cleared (&lt;20%)</div>
+    </div>
+    <div class="kpi">
+      <div class="val" id="kpi-liq">--%</div>
+      <div class="lbl">Peak Intraday Liquidity Reduction (&gt;50%)</div>
+    </div>
+    <div class="kpi">
+      <div class="val" id="kpi-viol">0</div>
+      <div class="lbl">Regulatory Reserve Floor Violations</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>1. Interbank RTGS Gridlock Resolver (FIFO vs Bilateral vs LSM)</h2>
+      <div style="margin-bottom: 10px;">
+        <select id="scenarioSelect">
+          <option value="ring_4bank_classic">4-Bank Circular Ring Gridlock</option>
+          <option value="mesh_6bank_tiered">6-Bank Tiered Wholesale Mesh</option>
+          <option value="star_hub_congestion">Star Hub & Spokes Congestion</option>
+          <option value="bilateral_vs_trilateral_mix">Bilateral + Trilateral Cycle Mix</option>
+          <option value="stress_normal_intraday">BCBS 248 Normal Intraday Wave</option>
+          <option value="stress_counterparty_default">BCBS 248 Counterparty Default</option>
+          <option value="stress_liquidity_hoarding">BCBS 248 Liquidity Hoarding</option>
+          <option value="stress_collateral_haircut_shock">BCBS 248 Haircut Shock (35%)</option>
+        </select>
+        <button onclick="runSettle()">Solve Gridlock</button>
+      </div>
+      <pre id="settleOutput">Click "Solve Gridlock" to run FIFO, Bilateral Offset, and Multilateral LSM...</pre>
+    </div>
+
+    <div class="card">
+      <h2>2. Basel III BCBS 248 Intraday Stress & Repo Optimizer</h2>
+      <div style="margin-bottom: 10px;">
+        <select id="stressSelect">
+          <option value="normal">Normal Operating Day (5% Haircut)</option>
+          <option value="counterparty_default">Counterparty Default (Outbound Freeze)</option>
+          <option value="liquidity_hoarding">Liquidity Hoarding (Delayed Payments)</option>
+          <option value="collateral_haircut_shock">Collateral Haircut Shock (35% Haircut)</option>
+        </select>
+        <button onclick="runStress()">Simulate BCBS 248</button>
+      </div>
+      <pre id="stressOutput">Click "Simulate BCBS 248" to compute hourly throughput (12:00, 15:00, EOD) & optimal repo pledge...</pre>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>3. ISO 20022 RTGS XML Generator & Parser (pacs.008 / pacs.009 / camt.054)</h2>
+      <div style="margin-bottom: 10px;">
+        <select id="msgTypeSelect">
+          <option value="pacs.008.001.08">pacs.008.001.08 (Customer Credit Transfer)</option>
+          <option value="pacs.009.001.08">pacs.009.001.08 (FI Credit Transfer)</option>
+          <option value="camt.054.001.08">camt.054.001.08 (Settlement Notification)</option>
+        </select>
+        <button onclick="generateISO()">Generate & Round-Trip Parse XML</button>
+      </div>
+      <pre id="isoOutput">Click "Generate & Round-Trip Parse XML" to inspect standards-compliant ISO 20022 XML...</pre>
+    </div>
+
+    <div class="card">
+      <h2>4. 8-Scenario Benchmark Suite</h2>
+      <button onclick="loadBench()">Run Full 8-Scenario Benchmark</button>
+      <div id="benchTableContainer"></div>
+    </div>
+  </div>
+
+  <script>
+    async function loadBench() {
+      const res = await fetch('/bench');
+      const data = await res.json();
+      const s = data.summary;
+      document.getElementById('kpi-lsm').textContent = s.lsm_volume_cleared_pct.toFixed(1) + '%';
+      document.getElementById('kpi-fifo').textContent = s.fifo_volume_cleared_pct.toFixed(1) + '%';
+      document.getElementById('kpi-liq').textContent = s.peak_liquidity_reduction_vs_fifo_pct.toFixed(1) + '%';
+      document.getElementById('kpi-viol').textContent = s.total_floor_violations;
+
+      let html = '<table><thead><tr><th>Scenario</th><th>FIFO %</th><th>Bilat %</th><th>LSM %</th><th>Viol</th></tr></thead><tbody>';
+      for (const r of data.scenarios) {
+        html += `<tr><td>${r.scenario_id}</td><td>${r.fifo_cleared_pct}%</td><td>${r.bilateral_cleared_pct}%</td><td><b>${r.lsm_cleared_pct}%</b></td><td>${r.floor_violations}</td></tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('benchTableContainer').innerHTML = html;
+    }
+
+    async function runSettle() {
+      const sc = document.getElementById('scenarioSelect').value;
+      const res = await fetch('/settle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({scenario_id: sc, engine: 'all'})
+      });
+      const data = await res.json();
+      document.getElementById('settleOutput').textContent = JSON.stringify(data.comparison, null, 2);
+    }
+
+    async function runStress() {
+      const sc = document.getElementById('stressSelect').value;
+      const res = await fetch('/stress', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({scenario: sc})
+      });
+      const data = await res.json();
+      document.getElementById('stressOutput').textContent = JSON.stringify({
+        scenario: data.scenario,
+        available_sod_cr: data.available_intraday_liquidity_sod_cr,
+        daily_max_usage_fifo_cr: data.daily_max_liquidity_usage_fifo_cr,
+        daily_max_usage_lsm_cr: data.daily_max_liquidity_usage_lsm_cr,
+        settled_1200_lsm_pct: data.settled_by_1200_lsm_pct,
+        settled_1500_lsm_pct: data.settled_by_1500_lsm_pct,
+        settled_eod_lsm_pct: data.settled_by_eod_lsm_pct,
+        optimal_repo_pledge_cr: data.collateral_optimization.optimal_repo_pledge_cr,
+        cost_savings_pct: data.collateral_optimization.cost_savings_vs_unoptimized_pct
+      }, null, 2);
+    }
+
+    async function generateISO() {
+      const mt = document.getElementById('msgTypeSelect').value;
+      const res = await fetch('/iso20022/generate', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({msg_type: mt})
+      });
+      const data = await res.json();
+      document.getElementById('isoOutput').textContent = data.xml + '\n\n' + JSON.stringify(data.payment, null, 2);
+    }
+
+    loadBench();
+  </script>
+</body>
+</html>
