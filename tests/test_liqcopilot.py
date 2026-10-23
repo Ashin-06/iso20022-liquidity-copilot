@@ -347,3 +347,14 @@ def test_parser_rejects_bad_amounts_dtds_and_missing_currency() -> None:
     bomb = '<?xml version="1.0"?><!DOCTYPE d [<!ENTITY a "aaaa">]><Document>&a;</Document>'
     with pytest.raises(ISO20022ValidationError):
         parse_iso20022_xml(bomb)
+
+
+def test_generated_xml_uses_schema_code_lists() -> None:
+    urgent = ISO20022Payment("M2", "E2", "SBININBBXXX", "HDFCINBBXXX", 10.0, priority="URGT")
+    for xml_doc in (generate_pacs008_xml(urgent), generate_pacs009_xml(urgent)):
+        assert "<InstrPrty>HIGH</InstrPrty>" in xml_doc  # Priority2Code has no URGT
+        assert "<SttlmPrty>URGT</SttlmPrty>" in xml_doc
+        assert "<ClrSys><Prtry>RTGS</Prtry></ClrSys>" in xml_doc  # Cd is limited to 3 chars
+        assert parse_iso20022_xml(xml_doc).priority == "URGT"
+    camt = generate_camt054_xml(urgent)
+    assert "<BkTxCd>" in camt and "<Prty>" not in camt

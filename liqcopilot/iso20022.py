@@ -216,6 +216,17 @@ def _populate_agent_elem(parent: ET.Element, tag_name: str, agent_code: str) -> 
     return agt
 
 
+def _add_clearing_system(sttlm_inf: ET.Element, system: str) -> None:
+    """ClrSys/Cd only takes codes of up to 3 characters (e.g. TGT); longer names go in Prtry."""
+    clr_sys = ET.SubElement(sttlm_inf, "ClrSys")
+    ET.SubElement(clr_sys, "Cd" if len(system) <= 3 else "Prtry").text = system
+
+
+def _add_priorities(pmt_tp: ET.Element, priority: str) -> None:
+    """PmtTpInf/InstrPrty is Priority2Code (HIGH or NORM); URGT is only valid in SttlmPrty."""
+    ET.SubElement(pmt_tp, "InstrPrty").text = "NORM" if priority == "NORM" else "HIGH"
+
+
 def generate_pacs008_xml(payment: ISO20022Payment) -> str:
     """Generate standards-compliant ISO 20022 pacs.008.001.08 (FIToFICstmrCdtTrf) XML."""
     payment.msg_type = "pacs.008.001.08"
@@ -232,8 +243,7 @@ def generate_pacs008_xml(payment: ISO20022Payment) -> str:
     ET.SubElement(grp_hdr, "NbOfTxs").text = "1"
     sttlm_inf = ET.SubElement(grp_hdr, "SttlmInf")
     ET.SubElement(sttlm_inf, "SttlmMtd").text = payment.settlement_method
-    clr_sys = ET.SubElement(sttlm_inf, "ClrSys")
-    ET.SubElement(clr_sys, "Cd").text = payment.settlement_system
+    _add_clearing_system(sttlm_inf, payment.settlement_system)
 
     tx = ET.SubElement(root, "CdtTrfTxInf")
     pmt_id = ET.SubElement(tx, "PmtId")
@@ -242,13 +252,14 @@ def generate_pacs008_xml(payment: ISO20022Payment) -> str:
     ET.SubElement(pmt_id, "TxId").text = payment.end_to_end_id
 
     pmt_tp = ET.SubElement(tx, "PmtTpInf")
-    ET.SubElement(pmt_tp, "InstrPrty").text = payment.priority
+    _add_priorities(pmt_tp, payment.priority)
     svc_lvl = ET.SubElement(pmt_tp, "SvcLvl")
     ET.SubElement(svc_lvl, "Cd").text = "URGP" if payment.priority == "URGT" else "NURG"
 
     amt_el = ET.SubElement(tx, "IntrBkSttlmAmt", Ccy=payment.currency)
     amt_el.text = f"{payment.amount:.2f}"
     ET.SubElement(tx, "IntrBkSttlmDt").text = payment.settlement_timestamp[:10]
+    ET.SubElement(tx, "SttlmPrty").text = payment.priority
     ET.SubElement(tx, "ChrgBr").text = "SHAR"
 
     dbtr = ET.SubElement(tx, "Dbtr")
@@ -278,8 +289,7 @@ def generate_pacs009_xml(payment: ISO20022Payment) -> str:
     ET.SubElement(grp_hdr, "NbOfTxs").text = "1"
     sttlm_inf = ET.SubElement(grp_hdr, "SttlmInf")
     ET.SubElement(sttlm_inf, "SttlmMtd").text = payment.settlement_method
-    clr_sys = ET.SubElement(sttlm_inf, "ClrSys")
-    ET.SubElement(clr_sys, "Cd").text = payment.settlement_system
+    _add_clearing_system(sttlm_inf, payment.settlement_system)
 
     tx = ET.SubElement(root, "CdtTrfTxInf")
     pmt_id = ET.SubElement(tx, "PmtId")
@@ -288,11 +298,12 @@ def generate_pacs009_xml(payment: ISO20022Payment) -> str:
     ET.SubElement(pmt_id, "TxId").text = payment.end_to_end_id
 
     pmt_tp = ET.SubElement(tx, "PmtTpInf")
-    ET.SubElement(pmt_tp, "InstrPrty").text = payment.priority
+    _add_priorities(pmt_tp, payment.priority)
 
     amt_el = ET.SubElement(tx, "IntrBkSttlmAmt", Ccy=payment.currency)
     amt_el.text = f"{payment.amount:.2f}"
     ET.SubElement(tx, "IntrBkSttlmDt").text = payment.settlement_timestamp[:10]
+    ET.SubElement(tx, "SttlmPrty").text = payment.priority
 
     _populate_agent_elem(tx, "InstgAgt", payment.debtor_agent)
     _populate_agent_elem(tx, "InstdAgt", payment.creditor_agent)
@@ -344,13 +355,15 @@ def generate_camt054_xml(
 
     bookg_dt = ET.SubElement(ntry, "BookgDt")
     ET.SubElement(bookg_dt, "DtTm").text = payment.settlement_timestamp
+    # BkTxCd is mandatory in a camt.054 entry
+    bk_tx_cd = ET.SubElement(ntry, "BkTxCd")
+    ET.SubElement(ET.SubElement(bk_tx_cd, "Prtry"), "Cd").text = "RTGS-SETTLEMENT"
 
     ntry_dtls = ET.SubElement(ntry, "NtryDtls")
     tx_dtls = ET.SubElement(ntry_dtls, "TxDtls")
     refs = ET.SubElement(tx_dtls, "Refs")
     ET.SubElement(refs, "MsgId").text = payment.msg_id
     ET.SubElement(refs, "EndToEndId").text = payment.end_to_end_id
-    ET.SubElement(refs, "Prty").text = payment.priority
 
     rltd_agts = ET.SubElement(tx_dtls, "RltdAgts")
     _populate_agent_elem(rltd_agts, "DbtrAgt", payment.debtor_agent)
@@ -415,7 +428,9 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
         cre_dt_tm = _find_first_text(msg_root, ["GrpHdr", "CreDtTm"])
         sttlm_mtd = _find_first_text(msg_root, ["GrpHdr", "SttlmInf", "SttlmMtd"]) or "CLRG"
         clr_sys = (
-            _find_first_text(msg_root, ["GrpHdr", "SttlmInf", "ClrSys", "Cd"]) or "RTGS"
+            _find_first_text(msg_root, ["GrpHdr", "SttlmInf", "ClrSys", "Cd"])
+            or _find_first_text(msg_root, ["GrpHdr", "SttlmInf", "ClrSys", "Prtry"])
+            or "RTGS"
         )
 
         tx = _find_first_elem(msg_root, ["CdtTrfTxInf"])
@@ -423,7 +438,11 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
             raise ISO20022ValidationError(f"Missing CdtTrfTxInf element in {expected_type}.")
 
         end_to_end_id = _find_first_text(tx, ["PmtId", "EndToEndId"])
-        priority = _find_first_text(tx, ["PmtTpInf", "InstrPrty"]) or "NORM"
+        priority = (
+            _find_first_text(tx, ["SttlmPrty"])
+            or _find_first_text(tx, ["PmtTpInf", "InstrPrty"])
+            or "NORM"
+        )
 
         amt_elem = _find_first_elem(tx, ["IntrBkSttlmAmt"])
         if amt_elem is None:
@@ -501,7 +520,7 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
             raise ISO20022ValidationError("Missing NtryDtls/TxDtls in camt.054.001.08.")
 
         end_to_end_id = _find_first_text(tx_dtls, ["Refs", "EndToEndId"])
-        priority = _find_first_text(tx_dtls, ["Refs", "Prty"]) or "NORM"
+        priority = "NORM"  # camt.054 carries no payment priority
         dbtr_agt_el = _find_first_elem(tx_dtls, ["RltdAgts", "DbtrAgt"])
         cdtr_agt_el = _find_first_elem(tx_dtls, ["RltdAgts", "CdtrAgt"])
 
