@@ -14,10 +14,12 @@ Implements three settlement engines:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .iso20022 import ISO20022Payment, generate_camt054_xml
+from .iso20022 import ISO20022Payment, generate_camt054_xml, validate_bic_or_ifsc
 
 PRIORITY_RANK: Dict[str, int] = {
     "URGT": 0,
@@ -36,6 +38,9 @@ class BankNode:
     reserve_floor: float
 
     def __post_init__(self) -> None:
+        self.bic = validate_bic_or_ifsc(self.bic)
+        if not (math.isfinite(self.opening_balance) and math.isfinite(self.reserve_floor)):
+            raise ValueError(f"Balance and floor must be finite numbers for {self.bic}.")
         if self.reserve_floor < 0:
             raise ValueError(f"Reserve floor F_i must be non-negative (got {self.reserve_floor}).")
         if self.opening_balance < self.reserve_floor - 1e-9:
@@ -76,8 +81,15 @@ class QueuedPayment:
         self.priority = self.priority.strip().upper()
         if self.priority not in PRIORITY_RANK:
             raise ValueError(f"Invalid priority '{self.priority}'.")
-        if self.amount <= 0:
-            raise ValueError(f"Payment amount must be positive (got {self.amount}).")
+        # NaN slips through a plain `<= 0` check and then poisons every balance it touches
+        if not math.isfinite(self.amount) or self.amount <= 0:
+            raise ValueError(f"Payment amount must be a positive finite number (got {self.amount}).")
+        self.sender = validate_bic_or_ifsc(self.sender)
+        self.receiver = validate_bic_or_ifsc(self.receiver)
+        try:
+            datetime.fromisoformat(self.timestamp)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Timestamp must be ISO 8601 (got {self.timestamp!r}).") from exc
         if self.sender == self.receiver:
             raise ValueError(f"Sender and receiver cannot be identical ('{self.sender}').")
 
@@ -150,6 +162,20 @@ class SettlementResult:
             "audit_trail": self.audit_trail,
             "camt054_count": len(self.camt054_notifications),
         }
+
+
+def _check_network(banks: List[BankNode], payments: List[QueuedPayment]) -> None:
+    """Reject inputs the engines would otherwise mis-account: unknown or duplicate banks, duplicate IDs."""
+    bics = [b.bic for b in banks]
+    if len(set(bics)) != len(bics):
+        raise ValueError("Duplicate bank BIC in the network.")
+    ids = [p.payment_id for p in payments]
+    if len(set(ids)) != len(ids):
+        # Engines track settled payments by ID; a duplicate makes one of them vanish
+        raise ValueError("Duplicate payment_id in the queue.")
+    unknown = {bic for p in payments for bic in (p.sender, p.receiver)} - set(bics)
+    if unknown:
+        raise ValueError(f"Payments reference banks not in the network: {sorted(unknown)}")
 
 
 def detect_payment_cycles(payments: List[QueuedPayment]) -> List[List[str]]:
@@ -270,6 +296,7 @@ def settle_fifo(
     Settles payments strictly in arrival/priority order when available liquidity
     B_sender - F_sender >= amount. Stalls when the head-of-line payment is blocked.
     """
+    _check_network(banks, payments)
     balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
     floors: Dict[str, float] = {b.bic: float(b.reserve_floor) for b in banks}
     opening: Dict[str, float] = dict(balances)
@@ -386,6 +413,7 @@ def settle_bilateral(
     net difference if within both banks' available liquidity, interleaved with
     gross settlement of unblocked head-of-line obligations.
     """
+    _check_network(banks, payments)
     balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
     floors: Dict[str, float] = {b.bic: float(b.reserve_floor) for b in banks}
     opening: Dict[str, float] = dict(balances)
@@ -556,6 +584,7 @@ def settle_multilateral_lsm(
        explore cycle-preserving subset improvements to guarantee maximum settled volume.
     4. Atomic Batch Execution: settle all p in S* simultaneously in a single atomic batch.
     """
+    _check_network(banks, payments)
     ordered = sorted(payments, key=lambda p: p.sort_key)
     n = len(ordered)
     avail_buffers: Dict[str, float] = {

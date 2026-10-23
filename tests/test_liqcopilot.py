@@ -308,3 +308,25 @@ def test_fastapi_endpoints() -> None:
     r_bench = client.get("/bench")
     assert r_bench.status_code == 200
     assert r_bench.json()["summary"]["scenario_count"] == 8
+
+
+def test_engines_reject_inputs_they_would_misaccount() -> None:
+    a, b = "SBININBBXXX", "HDFCINBBXXX"
+    banks = [BankNode(a, "A", 10.0, 0.0), BankNode(b, "B", 10.0, 0.0)]
+    # Duplicate IDs used to make the 100 Cr payment disappear from both lists
+    dup = [
+        QueuedPayment("X", a, b, 8.0, "URGT", 1),
+        QueuedPayment("X", b, a, 8.0, "URGT", 2),
+        QueuedPayment("X", a, b, 100.0, "NORM", 3),
+    ]
+    for engine in (settle_fifo, settle_bilateral, settle_multilateral_lsm):
+        with pytest.raises(ValueError):
+            engine(banks, dup)
+        with pytest.raises(ValueError):
+            engine(banks, [QueuedPayment("P", a, "ICICINBBXXX", 5.0)])
+    with pytest.raises(ValueError):
+        QueuedPayment("N", a, b, float("nan"))
+    with pytest.raises(ValueError):
+        QueuedPayment("T", a, b, 5.0, timestamp="yesterday")
+    with pytest.raises(ValueError):
+        BankNode(a, "A", float("inf"), 0.0)
