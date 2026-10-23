@@ -358,3 +358,19 @@ def test_generated_xml_uses_schema_code_lists() -> None:
         assert parse_iso20022_xml(xml_doc).priority == "URGT"
     camt = generate_camt054_xml(urgent)
     assert "<BkTxCd>" in camt and "<Prty>" not in camt
+
+
+def test_lsm_reports_whether_its_answer_is_proven_optimal() -> None:
+    sc = get_benchmark_scenarios()[0]
+    batch = settle_multilateral_lsm(sc["banks"], sc["payments"]).audit_trail[-1]
+    assert batch["proven_optimal"] is True
+
+    bics = [f"SBININBB{i:03d}" for i in range(12)]
+    banks = [BankNode(b, b, 100.0, 90.0) for b in bics]
+    big = [QueuedPayment(f"P{i}", bics[i % 12], bics[(i * 5 + 1) % 12], 15.0 + i, "NORM", i + 1)
+           for i in range(40) if bics[i % 12] != bics[(i * 5 + 1) % 12]]
+    batch = settle_multilateral_lsm(banks, big).audit_trail[-1]
+    assert batch["proven_optimal"] is False and "heuristic" in batch["search"]
+    # A dense graph has millions of cycles; detection stops at its cap
+    dense = [QueuedPayment(f"D{i}-{j}", a, b, 1.0) for i, a in enumerate(bics) for j, b in enumerate(bics) if a != b]
+    assert len(detect_payment_cycles(dense)) <= 200

@@ -26,6 +26,10 @@ PRIORITY_RANK: Dict[str, int] = {
     "HIGH": 1,
     "NORM": 2,
 }
+MAX_CYCLES = 200
+MAX_CYCLE_EXPANSIONS = 100_000
+EXACT_SEARCH_MAX_PAYMENTS = 28
+EXACT_SEARCH_MAX_NODES = 15_000
 
 
 @dataclass
@@ -180,9 +184,14 @@ def _check_network(banks: List[BankNode], payments: List[QueuedPayment]) -> None
 
 def detect_payment_cycles(payments: List[QueuedPayment]) -> List[List[str]]:
     """
-    Detect elementary directed cycles in the queued payment obligation graph.
+    Detect elementary directed cycles (up to 8 banks long) in the queued payment obligation graph.
     Returns a deduplicated list of cycle node sequences [B_1, B_2, ..., B_k, B_1].
+
+    The number of cycles grows exponentially with network density, so the search stops after
+    MAX_CYCLES cycles or MAX_CYCLE_EXPANSIONS path extensions. It is diagnostic only; the LSM
+    solver does not depend on it.
     """
+    expansions = 0
     adj: Dict[str, Set[str]] = {}
     nodes: Set[str] = set()
     for p in payments:
@@ -199,7 +208,10 @@ def detect_payment_cycles(payments: List[QueuedPayment]) -> List[List[str]]:
             (start_node, [start_node], {start_node})
         ]
         while stack:
+            if len(cycles) >= MAX_CYCLES or expansions >= MAX_CYCLE_EXPANSIONS:
+                break
             curr, path, visited = stack.pop()
+            expansions += 1
             for nxt in sorted(adj.get(curr, set())):
                 if nxt == start_node and len(path) >= 2:
                     # Canonicalize cycle rotation by smallest BIC first
@@ -572,16 +584,18 @@ def settle_multilateral_lsm(
     """
     Engine 3: Multilateral Cycle-Netting LSM Solver (Liquidity-Saving Mechanism).
 
-    Finds the maximum-value subset of queued payments S <= Q such that for every bank i:
+    Looks for the maximum-value subset of queued payments S <= Q such that for every bank i:
         B_i + sum_{p in S, to=i} a_p - sum_{p in S, from=i} a_p >= F_i
+    This is a multi-constraint knapsack problem (NP-hard). The result is proven optimal only
+    when the exact search runs to completion; the batch audit entry says which case applies.
 
     Algorithm:
     1. Detect directed payment cycles in Q for topological diagnostics.
     2. Iterative Constrained Subset Pruning: start with S = Q and iteratively prune
        outbound edges from the most liquidity-deficient bank until all banks satisfy
        their reserve floor constraint.
-    3. Local Search & Branch-and-Bound Refinement: re-insert feasible payments and
-       explore cycle-preserving subset improvements to guarantee maximum settled volume.
+    3. Branch-and-Bound: exact search over include/exclude decisions for queues of up to
+       EXACT_SEARCH_MAX_PAYMENTS payments, stopped after EXACT_SEARCH_MAX_NODES nodes.
     4. Atomic Batch Execution: settle all p in S* simultaneously in a single atomic batch.
     """
     _check_network(banks, payments)
@@ -658,8 +672,10 @@ def settle_multilateral_lsm(
     best_indices: Set[int] = set(active)
     best_volume: float = sum(ordered[i].amount for i in best_indices)
 
-    # Phase 3: Exact Branch-and-Bound / Local Swap Refinement for optimal subset S*
-    if n <= 28:
+    # Phase 3: Exact Branch-and-Bound for optimal subset S*
+    node_visits = 0
+    max_visits = EXACT_SEARCH_MAX_NODES
+    if n <= EXACT_SEARCH_MAX_PAYMENTS:
         # Sort candidate indices by descending amount so branch-and-bound finds high-value subsets fast
         search_order = sorted(
             range(n),
@@ -678,9 +694,6 @@ def settle_multilateral_lsm(
             p = ordered[search_order[pos]]
             rem_inflow[pos] = dict(rem_inflow[pos + 1])
             rem_inflow[pos][p.receiver] = rem_inflow[pos].get(p.receiver, 0.0) + p.amount
-
-        node_visits = 0
-        max_visits = 15000
 
         def _dfs(
             pos: int,
@@ -724,6 +737,13 @@ def settle_multilateral_lsm(
 
         _dfs(0, 0.0, dict(avail_buffers), [])
 
+    if n > EXACT_SEARCH_MAX_PAYMENTS:
+        search = "heuristic only: exact search skipped above 28 payments"
+    elif node_visits > max_visits:
+        search = "node budget reached: best subset found, not proven optimal"
+    else:
+        search = "exhaustive: proven optimal"
+
     # Phase 4: Execute Atomic Multilateral Batch Settlement
     final_balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
     settled: List[QueuedPayment] = []
@@ -753,6 +773,8 @@ def settle_multilateral_lsm(
             "gross_to_net_compression_ratio": round(
                 best_volume / max(net_batch_drawdown, 1.0), 2
             ),
+            "search": search,
+            "proven_optimal": search.startswith("exhaustive"),
         }
     )
 
