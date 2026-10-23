@@ -374,3 +374,27 @@ def test_lsm_reports_whether_its_answer_is_proven_optimal() -> None:
     # A dense graph has millions of cycles; detection stops at its cap
     dense = [QueuedPayment(f"D{i}-{j}", a, b, 1.0) for i, a in enumerate(bics) for j, b in enumerate(bics) if a != b]
     assert len(detect_payment_cycles(dense)) <= 200
+
+
+def test_api_key_and_input_limits(monkeypatch) -> None:
+    import liqcopilot.api as api
+
+    client = TestClient(app)
+    monkeypatch.setattr(api, "API_KEY", "s3cret")
+    assert client.post("/settle", json={"scenario_id": "ring_4bank_classic"}).status_code == 401
+    assert client.get("/bench").status_code == 401
+    assert client.get("/health").status_code == 200
+
+    hdr = {"X-API-Key": "s3cret"}
+    assert client.post("/settle", json={"scenario_id": "ring_4bank_classic"}, headers=hdr).status_code == 200
+    # A custom network that pays a bank it does not contain is a 400, not a 500
+    custom = {
+        "banks": [{"bic": "SBININBBXXX", "opening_balance": 10, "reserve_floor": 0},
+                  {"bic": "HDFCINBBXXX", "opening_balance": 10, "reserve_floor": 0}],
+        "payments": [{"payment_id": "P1", "sender": "SBININBBXXX", "receiver": "ICICINBBXXX", "amount": 5}],
+    }
+    assert client.post("/settle", json=custom, headers=hdr).status_code == 400
+    too_many = dict(custom, payments=[dict(custom["payments"][0], payment_id=f"P{i}")
+                                      for i in range(api.MAX_PAYMENTS + 1)])
+    assert client.post("/settle", json=too_many, headers=hdr).status_code == 422
+    assert client.post("/iso20022/generate", json={"credit_debit_indicator": "<x/>"}, headers=hdr).status_code == 422

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uvicorn
 
@@ -42,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "serve":
+        if args.host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("LIQCOPILOT_API_KEY"):
+            print("Refusing to listen on a non-loopback address without LIQCOPILOT_API_KEY set.", file=sys.stderr)
+            return 2
         uvicorn.run("liqcopilot.api:app", host=args.host, port=args.port, reload=False)
         return 0
 

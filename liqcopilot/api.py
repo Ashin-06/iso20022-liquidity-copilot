@@ -9,15 +9,20 @@ Endpoints:
 - POST /settle           -> Run FIFO Gross, Bilateral Offset, and Multilateral LSM
 - POST /stress           -> Run Basel III BCBS 248 intraday liquidity stress simulation
 - GET  /bench            -> Run 8-scenario RTGS gridlock & stress benchmark suite
+
+Set LIQCOPILOT_API_KEY to require it in the X-API-Key header on the POST endpoints and /bench
+(unset = open, for local use; `python -m liqcopilot serve` refuses a non-loopback host without it).
 """
 
 from __future__ import annotations
 
+import hmac
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .bench import get_benchmark_scenarios, run_all_benchmarks
@@ -47,43 +52,62 @@ app = FastAPI(
 )
 
 CONSOLE_HTML_PATH = Path(__file__).resolve().parent.parent / "web" / "console.html"
+API_KEY = os.environ.get("LIQCOPILOT_API_KEY")
+MAX_BODY_BYTES = 1_000_000
+MAX_BANKS = 30
+MAX_PAYMENTS = 100  # the bilateral engine is roughly cubic in the queue length
+MAX_AMOUNT = 1e9  # crore
+
+
+def require_key(x_api_key: str | None = Header(default=None)) -> None:
+    if API_KEY and not hmac.compare_digest(x_api_key or "", API_KEY):
+        raise HTTPException(401, "missing or wrong X-API-Key")
+
+
+@app.middleware("http")
+async def limit_body(request: Request, call_next):
+    if request.method == "POST":
+        length = request.headers.get("content-length", "")
+        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
+            return JSONResponse({"detail": "body missing Content-Length or over 1 MB"}, status_code=413)
+    return await call_next(request)
 
 
 class ParseXMLRequest(BaseModel):
-    xml: str = Field(..., description="Raw ISO 20022 XML document (pacs.008, pacs.009, or camt.054)")
+    xml: str = Field(..., max_length=200_000, description="Raw ISO 20022 XML document (pacs.008, pacs.009, or camt.054)")
 
 
 class GenerateXMLRequest(BaseModel):
-    msg_type: str = Field(default="pacs.008.001.08")
-    msg_id: str = Field(default="MSG-RTGS-20261022-001")
-    end_to_end_id: str = Field(default="E2E-RTGS-20261022-001")
-    debtor_agent: str = Field(default="SBININBBXXX")
-    creditor_agent: str = Field(default="HDFCINBBXXX")
-    amount: float = Field(default=250.0)
-    currency: str = Field(default="INR")
-    priority: str = Field(default="URGT")
-    settlement_timestamp: str = Field(default="2026-10-22T09:30:00Z")
-    credit_debit_indicator: str = Field(default="CRDT")
-    status: str = Field(default="BOOK")
+    msg_type: Literal["pacs.008.001.08", "pacs.009.001.08", "camt.054.001.08"] = "pacs.008.001.08"
+    msg_id: str = Field(default="MSG-RTGS-20261022-001", max_length=35)
+    end_to_end_id: str = Field(default="E2E-RTGS-20261022-001", max_length=35)
+    debtor_agent: str = Field(default="SBININBBXXX", max_length=11)
+    creditor_agent: str = Field(default="HDFCINBBXXX", max_length=11)
+    amount: float = Field(default=250.0, gt=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    currency: str = Field(default="INR", max_length=3)
+    priority: Literal["URGT", "HIGH", "NORM"] = "URGT"
+    settlement_timestamp: str = Field(default="2026-10-22T09:30:00Z", max_length=40)
+    credit_debit_indicator: Literal["CRDT", "DBIT"] = "CRDT"
+    status: Literal["BOOK", "PDNG", "INFO"] = "BOOK"
 
 
 class BankInput(BaseModel):
-    bic: str
-    name: str = "Wholesale Bank"
-    opening_balance: float
-    reserve_floor: float
+    bic: str = Field(..., max_length=11)
+    name: str = Field("Wholesale Bank", max_length=140)
+    opening_balance: float = Field(..., ge=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    reserve_floor: float = Field(..., ge=0, le=MAX_AMOUNT, allow_inf_nan=False)
 
 
 class PaymentInput(BaseModel):
-    payment_id: str
-    sender: str
-    receiver: str
-    amount: float
-    priority: str = "NORM"
-    arrival_order: int = 0
-    timestamp: str = "2026-10-22T09:30:00Z"
-    msg_type: str = "pacs.008.001.08"
-    currency: str = "INR"
+    payment_id: str = Field(..., min_length=1, max_length=35)
+    sender: str = Field(..., max_length=11)
+    receiver: str = Field(..., max_length=11)
+    amount: float = Field(..., gt=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    priority: Literal["URGT", "HIGH", "NORM"] = "NORM"
+    arrival_order: int = Field(0, ge=0, le=10**6)
+    timestamp: str = Field("2026-10-22T09:30:00Z", max_length=40)
+    msg_type: Literal["pacs.008.001.08", "pacs.009.001.08"] = "pacs.008.001.08"
+    currency: str = Field("INR", max_length=3)
 
 
 class SettleRequest(BaseModel):
@@ -93,19 +117,21 @@ class SettleRequest(BaseModel):
     )
     engine: Optional[str] = Field(
         default="all",
+        max_length=20,
         description="'fifo', 'bilateral', 'multilateral_lsm', or 'all'",
     )
-    banks: Optional[List[BankInput]] = None
-    payments: Optional[List[PaymentInput]] = None
+    banks: Optional[List[BankInput]] = Field(None, max_length=MAX_BANKS)
+    payments: Optional[List[PaymentInput]] = Field(None, max_length=MAX_PAYMENTS)
 
 
 class StressRequest(BaseModel):
     scenario: str = Field(
         default="normal",
+        max_length=40,
         description="One of: 'normal', 'counterparty_default', 'liquidity_hoarding', 'collateral_haircut_shock'",
     )
-    banks: Optional[List[BankInput]] = None
-    payments: Optional[List[PaymentInput]] = None
+    banks: Optional[List[BankInput]] = Field(None, max_length=MAX_BANKS)
+    payments: Optional[List[PaymentInput]] = Field(None, max_length=MAX_PAYMENTS)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -128,7 +154,7 @@ def health_check() -> Dict[str, Any]:
     }
 
 
-@app.post("/iso20022/parse")
+@app.post("/iso20022/parse", dependencies=[Depends(require_key)])
 def api_parse_iso20022(req: ParseXMLRequest) -> Dict[str, Any]:
     try:
         parsed = parse_iso20022_xml(req.xml)
@@ -140,7 +166,7 @@ def api_parse_iso20022(req: ParseXMLRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/iso20022/generate")
+@app.post("/iso20022/generate", dependencies=[Depends(require_key)])
 def api_generate_iso20022(req: GenerateXMLRequest) -> Dict[str, Any]:
     try:
         payment = ISO20022Payment(
@@ -168,7 +194,7 @@ def api_generate_iso20022(req: GenerateXMLRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/settle")
+@app.post("/settle", dependencies=[Depends(require_key)])
 def api_settle(req: SettleRequest) -> Dict[str, Any]:
     scenarios = {s["scenario_id"]: s for s in get_benchmark_scenarios()}
 
@@ -210,14 +236,17 @@ def api_settle(req: SettleRequest) -> Dict[str, Any]:
         payments = scenarios[sc_id]["payments"]
 
     engine = (req.engine or "all").strip().lower()
-    if engine == "fifo":
-        return settle_fifo(banks, payments).to_dict()
-    if engine == "bilateral":
-        return settle_bilateral(banks, payments).to_dict()
-    if engine in ("multilateral_lsm", "lsm"):
-        return settle_multilateral_lsm(banks, payments).to_dict()
-    if engine == "all":
-        return compare_settlement_engines(banks, payments)
+    try:
+        if engine == "fifo":
+            return settle_fifo(banks, payments).to_dict()
+        if engine == "bilateral":
+            return settle_bilateral(banks, payments).to_dict()
+        if engine in ("multilateral_lsm", "lsm"):
+            return settle_multilateral_lsm(banks, payments).to_dict()
+        if engine == "all":
+            return compare_settlement_engines(banks, payments)
+    except ValueError as exc:  # unknown or duplicate banks/payments in a custom network
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     raise HTTPException(
         status_code=400,
@@ -225,7 +254,7 @@ def api_settle(req: SettleRequest) -> Dict[str, Any]:
     )
 
 
-@app.post("/stress")
+@app.post("/stress", dependencies=[Depends(require_key)])
 def api_stress(req: StressRequest) -> Dict[str, Any]:
     try:
         custom_banks = (
@@ -264,6 +293,6 @@ def api_stress(req: StressRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/bench")
+@app.get("/bench", dependencies=[Depends(require_key)])
 def api_bench() -> Dict[str, Any]:
     return run_all_benchmarks()

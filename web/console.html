@@ -124,7 +124,10 @@
         pacs.008 / pacs.009 / camt.054 XML Engine • Multilateral Cycle-Netting LSM • Basel III BCBS 248 Stress Simulator
       </p>
     </div>
-    <span class="badge">PORT 8013 • RTGS LIVE</span>
+    <span>
+      <input type="password" id="apiKey" placeholder="X-API-Key (if set)" autocomplete="off" />
+      <span class="badge">PORT 8013 • SIMULATION</span>
+    </span>
   </header>
 
   <div class="kpi-row">
@@ -191,7 +194,7 @@
         </select>
         <button onclick="generateISO()">Generate & Round-Trip Parse XML</button>
       </div>
-      <pre id="isoOutput">Click "Generate & Round-Trip Parse XML" to inspect standards-compliant ISO 20022 XML...</pre>
+      <pre id="isoOutput">Click "Generate & Round-Trip Parse XML" to inspect the generated ISO 20022 XML (not validated against the official XSDs)...</pre>
     </div>
 
     <div class="card">
@@ -202,9 +205,21 @@
   </div>
 
   <script>
+    function esc(v) {
+      return String(v).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function api(path, opts = {}) {
+      const key = document.getElementById('apiKey').value;
+      const headers = { ...(opts.headers || {}) };
+      if (key) headers['X-API-Key'] = key;
+      return fetch(path, { ...opts, headers });
+    }
+
     async function loadBench() {
-      const res = await fetch('/bench');
+      const res = await api('/bench');
       const data = await res.json();
+      if (!res.ok) { document.getElementById('benchTableContainer').textContent = 'Error: ' + JSON.stringify(data.detail); return; }
       const s = data.summary;
       document.getElementById('kpi-lsm').textContent = s.lsm_volume_cleared_pct.toFixed(1) + '%';
       document.getElementById('kpi-fifo').textContent = s.fifo_volume_cleared_pct.toFixed(1) + '%';
@@ -213,7 +228,7 @@
 
       let html = '<table><thead><tr><th>Scenario</th><th>FIFO %</th><th>Bilat %</th><th>LSM %</th><th>Viol</th></tr></thead><tbody>';
       for (const r of data.scenarios) {
-        html += `<tr><td>${r.scenario_id}</td><td>${r.fifo_cleared_pct}%</td><td>${r.bilateral_cleared_pct}%</td><td><b>${r.lsm_cleared_pct}%</b></td><td>${r.floor_violations}</td></tr>`;
+        html += `<tr><td>${esc(r.scenario_id)}</td><td>${r.fifo_cleared_pct}%</td><td>${r.bilateral_cleared_pct}%</td><td><b>${r.lsm_cleared_pct}%</b></td><td>${r.floor_violations}</td></tr>`;
       }
       html += '</tbody></table>';
       document.getElementById('benchTableContainer').innerHTML = html;
@@ -221,7 +236,7 @@
 
     async function runSettle() {
       const sc = document.getElementById('scenarioSelect').value;
-      const res = await fetch('/settle', {
+      const res = await api('/settle', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({scenario_id: sc, engine: 'all'})
@@ -232,7 +247,7 @@
 
     async function runStress() {
       const sc = document.getElementById('stressSelect').value;
-      const res = await fetch('/stress', {
+      const res = await api('/stress', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({scenario: sc})
@@ -253,7 +268,7 @@
 
     async function generateISO() {
       const mt = document.getElementById('msgTypeSelect').value;
-      const res = await fetch('/iso20022/generate', {
+      const res = await api('/iso20022/generate', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({msg_type: mt})
