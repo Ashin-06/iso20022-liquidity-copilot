@@ -16,7 +16,6 @@ from liqcopilot.bench import (
 from liqcopilot.gridlock import (
     BankNode,
     QueuedPayment,
-    compare_settlement_engines,
     detect_payment_cycles,
     settle_bilateral,
     settle_fifo,
@@ -33,7 +32,6 @@ from liqcopilot.iso20022 import (
     validate_bic_or_ifsc,
 )
 from liqcopilot.stress import (
-    optimize_collateral_vs_delay,
     simulate_bcbs248_stress,
 )
 

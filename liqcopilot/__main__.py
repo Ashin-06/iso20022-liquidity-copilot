@@ -41,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    # The report uses an em dash, which a cp1252 Windows console prints as garbage
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     if args.command == "serve":
         if args.host not in ("127.0.0.1", "localhost", "::1") and not os.environ.get("LIQCOPILOT_API_KEY"):
