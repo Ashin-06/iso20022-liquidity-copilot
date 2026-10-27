@@ -57,23 +57,47 @@ In three of the four scenarios the LSM clears everything with no extra collatera
 ## Run it
 
 ```bash
-pip install -r requirements.txt
-python -m pytest -q                                  # 17 tests
+pip install -r requirements.txt                      # or: pip install -r requirements-dev.lock && pip install -e .
+python -m pytest -q                                  # 30 tests
 python -m liqcopilot bench                           # the table above
 python -m liqcopilot stress --scenario counterparty_default
-python -m liqcopilot serve --port 8013               # API + console at http://127.0.0.1:8013
+python -m liqcopilot serve                           # API + console at http://127.0.0.1:8013 (open, loopback only)
+docker build -t iso20022-liquidity-copilot .         # production image; see docs/runbook.md
 ```
 
-Endpoints: `POST /iso20022/parse`, `POST /iso20022/generate`, `POST /settle` (a benchmark scenario or your own banks and payments), `POST /stress`, `GET /bench`, `GET /health`.
+**What-if endpoints** (nothing is stored): `POST /iso20022/parse`, `POST /iso20022/generate`, `POST /settle` (a benchmark scenario or your own banks and payments), `POST /stress`, `GET /bench`. Custom networks are capped at 30 banks and 100 payments.
 
-Set `LIQCOPILOT_API_KEY` to require it in the `X-API-Key` header on the POST endpoints and `/bench`; the console has a field for it. Without the key the server runs open, and `serve` refuses to bind a non-loopback address. Custom networks are capped at 30 banks and 100 payments, and request bodies at 1 MB.
+**The RTGS queue** (stored in SQLite or Postgres):
+- `PUT /rtgs/participants`, `GET /rtgs/participants`: set and read each bank's balance and reserve floor.
+- `POST /rtgs/payments`: queue payments, as JSON or as one pacs.008 / pacs.009 message. Duplicate IDs get a 409, unknown banks a 400, and the queue holds at most 100 payments.
+- `POST /rtgs/settle {"engine": "multilateral_lsm"}`: run one engine on the queue. In one transaction it marks what settled and books the final balances. `GET /rtgs/payments` and `GET /rtgs/runs` show the result.
+
+**Money.** Amounts are crores, sent as JSON numbers or decimal strings with up to 9 decimal places (whole paise). They are `Decimal` throughout the engines and the stress runs' settlement, integer paise in the database, and exact decimal strings in responses. NaN, infinity and fractions of a paisa are refused. The stress simulator's cost model (repo rates, haircuts, delay penalties) is an estimate and stays in floating point. Its results feed the engines only as exact amounts. Moving to `Decimal` left every number in the tables above unchanged (checked field by field).
+
+**Who may call.** Each caller gets an API key with a role: `participant` (a bank's gateway) queues payments and reads; `analyst` reads and runs what-ifs; `operator` also sets positions and settles; `monitor` scrapes `/metrics`. Make keys with `python -m liqcopilot.ops keygen` and list their hashes in `LIQCOPILOT_API_KEYS` or `LIQCOPILOT_KEYS_FILE`; the console has a field for the key. Without keys the server runs open and refuses to bind a non-loopback address; with `LIQCOPILOT_ENV=production` it refuses to start without hashed keys and a database. XML is parsed with `defusedxml`. Settings, backups and incident steps are in [docs/runbook.md](docs/runbook.md).
 
 ## Limits
 
 - **Simulation only.** There is no connection to an RTGS, a SWIFT/ISO 20022 network, or any bank system. The banks, balances and payments are made up; the BICs are only used as labels.
 - **XML is not schema-validated.** The generator and parser cover a small subset of each message and have not been checked against the official XSDs. A real integration would validate against the published schemas and handle the business application header (head.001), UETRs, batches with several transactions, and much more.
 - **Benchmark scenarios favour netting by design.** See above. There is no evaluation on realistic traffic.
-- **Money is float.** Balances and amounts are Python floats with a 1e-9 tolerance. A ledger would use integer minor units or `Decimal`.
 - **LSM optimality is limited.** It is proven only for queues of up to 28 payments within the node budget. Larger queues get a greedy answer, and the audit trail says so.
 - **Stress metrics are simplified.** Peak usage is system-wide rather than per bank, and the cost model's rates and the 10 pledge sizes are assumptions.
-- **No deployment story**: no TLS, rate limiting, persistence, audit log or authentication beyond a shared key.
+- **A queue, not an RTGS.** The stored queue settles on request and books balances, but there is no intraday credit facility, no cancellation or re-prioritisation of queued payments, no end-of-day processing, and nothing stops two replicas from settling the same queue at once (run one). TLS is left to the ingress.
+
+## Production readiness
+
+**In place** (see [docs/runbook.md](docs/runbook.md) and [docs/threat-model.md](docs/threat-model.md)):
+- Pinned dependencies (`requirements.lock`), `pyproject.toml`, a container image that runs as a non-root user with a health check, and CI (ruff, bandit, pip-audit, tests with coverage).
+- Production mode that refuses to start without hashed per-client API keys and a database. No default secrets, and no public listening without keys.
+- Roles on keys, per-client rate limits, a body cap, security headers, CORS only for listed origins, `defusedxml` for incoming XML, and errors that don't echo input.
+- Money as `Decimal` and integer paise, never float, in the engines, the queue and the database.
+- A durable payment queue with participant positions and settlement runs, booked atomically, with numbered migrations.
+- JSON logs with request IDs, `/healthz`, `/readyz`, and Prometheus metrics for queued, settled and left-queued payments.
+
+**Still needed before it touches a real RTGS**, none of which code can supply:
+- An independent security review and penetration test.
+- Validation on real queue data from the RBI's RTGS or a bank's own intraday flows. Every scenario here is hand-built and favours netting by design.
+- RBI sign-off: RTGS membership rules, the intraday liquidity facility, and the BCBS 248 reporting the bank actually files.
+- Real integrations: the RTGS and SFMS / ISO 20022 network with schema-validated messages (official XSDs, head.001, UETRs), the core banking ledger, and the collateral system.
+- Keys and certificates in an HSM or a KMS, and an on-call team with SLOs that cover the RTGS operating window.
