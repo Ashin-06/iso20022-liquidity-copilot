@@ -3,28 +3,35 @@ FastAPI REST API for ISO 20022 RTGS Liquidity Copilot (port 8013).
 
 Endpoints:
 - GET  /                 -> Interactive HTML Web Console (`web/console.html`)
-- GET  /health           -> Health check & version metadata
-- POST /iso20022/parse   -> Parse & validate pacs.008 / pacs.009 / camt.054 XML
-- POST /iso20022/generate-> Generate standards-compliant ISO 20022 XML
-- POST /settle           -> Run FIFO Gross, Bilateral Offset, and Multilateral LSM
-- POST /stress           -> Run Basel III BCBS 248 intraday liquidity stress simulation
-- GET  /bench            -> Run 8-scenario RTGS gridlock & stress benchmark suite
+- GET  /healthz, /readyz -> Liveness and readiness; GET /metrics -> Prometheus [metrics]
+- POST /iso20022/parse   -> Parse & validate pacs.008 / pacs.009 / camt.054 XML [simulate]
+- POST /iso20022/generate-> Generate standards-compliant ISO 20022 XML [simulate]
+- POST /settle           -> What-if: FIFO Gross, Bilateral Offset, and Multilateral LSM on a given network [simulate]
+- POST /stress           -> Run Basel III BCBS 248 intraday liquidity stress simulation [simulate]
+- GET  /bench            -> Run 8-scenario RTGS gridlock & stress benchmark suite [simulate]
+- PUT  /rtgs/participants -> Set participants' balances and reserve floors [positions]
+- GET  /rtgs/participants -> Current positions [read]
+- POST /rtgs/payments    -> Queue payments (JSON, or one pacs.008 / pacs.009 message) [submit]
+- GET  /rtgs/payments    -> The queue, by status [read]
+- POST /rtgs/settle      -> Settle the queue with one engine and book the result [settle]
+- GET  /rtgs/runs        -> Past settlement runs [read]
 
-Set LIQCOPILOT_API_KEY to require it in the X-API-Key header on the POST endpoints and /bench
-(unset = open, for local use; `python -m liqcopilot serve` refuses a non-loopback host without it).
+Amounts are crores, sent as JSON numbers or decimal strings and handled as Decimal; the
+queue stores integer paise. Callers send an API key (X-API-Key or Authorization: Bearer)
+whose role decides the permissions in brackets; see ops.py and docs/runbook.md.
 """
 
 from __future__ import annotations
 
-import hmac
-import os
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from . import db, ops
 from .bench import get_benchmark_scenarios, run_all_benchmarks
 from .gridlock import (
     BankNode,
@@ -40,7 +47,12 @@ from .iso20022 import (
     generate_iso20022_xml,
     parse_iso20022_xml,
 )
+from .store import DuplicatePayment, RTGSStore
 from .stress import simulate_bcbs248_stress
+
+settings = ops.load_settings()
+ops.setup_logging(settings.log_level)
+store = RTGSStore(db.connect(settings.database_url))
 
 app = FastAPI(
     title="ISO 20022 RTGS Liquidity Copilot & Intraday Gridlock Resolver",
@@ -51,26 +63,15 @@ app = FastAPI(
     ),
 )
 
+ops.install(app, settings, {"database": lambda: store.db.connect().close()})
+
 CONSOLE_HTML_PATH = Path(__file__).resolve().parent.parent / "web" / "console.html"
-API_KEY = os.environ.get("LIQCOPILOT_API_KEY")
-MAX_BODY_BYTES = 1_000_000
 MAX_BANKS = 30
 MAX_PAYMENTS = 100  # the bilateral engine is roughly cubic in the queue length
-MAX_AMOUNT = 1e9  # crore
-
-
-def require_key(x_api_key: str | None = Header(default=None)) -> None:
-    if API_KEY and not hmac.compare_digest(x_api_key or "", API_KEY):
-        raise HTTPException(401, "missing or wrong X-API-Key")
-
-
-@app.middleware("http")
-async def limit_body(request: Request, call_next):
-    if request.method == "POST":
-        length = request.headers.get("content-length", "")
-        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
-            return JSONResponse({"detail": "body missing Content-Length or over 1 MB"}, status_code=413)
-    return await call_next(request)
+MAX_QUEUE = 100  # payments a settlement run takes on, for the same reason
+MAX_AMOUNT = Decimal(10**9)  # crore
+# Crores with up to 9 decimals: whole paise. NaN and infinity are refused.
+Money = dict(le=MAX_AMOUNT, max_digits=19, decimal_places=9)
 
 
 class ParseXMLRequest(BaseModel):
@@ -83,7 +84,7 @@ class GenerateXMLRequest(BaseModel):
     end_to_end_id: str = Field(default="E2E-RTGS-20261022-001", max_length=35)
     debtor_agent: str = Field(default="SBININBBXXX", max_length=11)
     creditor_agent: str = Field(default="HDFCINBBXXX", max_length=11)
-    amount: float = Field(default=250.0, gt=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    amount: Decimal = Field(default=Decimal("250"), gt=0, le=MAX_AMOUNT, max_digits=19, decimal_places=5)
     currency: str = Field(default="INR", max_length=3)
     priority: Literal["URGT", "HIGH", "NORM"] = "URGT"
     settlement_timestamp: str = Field(default="2026-10-22T09:30:00Z", max_length=40)
@@ -94,15 +95,15 @@ class GenerateXMLRequest(BaseModel):
 class BankInput(BaseModel):
     bic: str = Field(..., max_length=11)
     name: str = Field("Wholesale Bank", max_length=140)
-    opening_balance: float = Field(..., ge=0, le=MAX_AMOUNT, allow_inf_nan=False)
-    reserve_floor: float = Field(..., ge=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    opening_balance: Decimal = Field(..., ge=0, **Money)
+    reserve_floor: Decimal = Field(..., ge=0, **Money)
 
 
 class PaymentInput(BaseModel):
     payment_id: str = Field(..., min_length=1, max_length=35)
     sender: str = Field(..., max_length=11)
     receiver: str = Field(..., max_length=11)
-    amount: float = Field(..., gt=0, le=MAX_AMOUNT, allow_inf_nan=False)
+    amount: Decimal = Field(..., gt=0, **Money)
     priority: Literal["URGT", "HIGH", "NORM"] = "NORM"
     arrival_order: int = Field(0, ge=0, le=10**6)
     timestamp: str = Field("2026-10-22T09:30:00Z", max_length=40)
@@ -144,17 +145,7 @@ def read_console() -> HTMLResponse:
     )
 
 
-@app.get("/health")
-def health_check() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": "liqcopilot",
-        "port": 8013,
-        "version": "1.0.0",
-    }
-
-
-@app.post("/iso20022/parse", dependencies=[Depends(require_key)])
+@app.post("/iso20022/parse", dependencies=[Depends(ops.require("simulate"))])
 def api_parse_iso20022(req: ParseXMLRequest) -> Dict[str, Any]:
     try:
         parsed = parse_iso20022_xml(req.xml)
@@ -166,7 +157,7 @@ def api_parse_iso20022(req: ParseXMLRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/iso20022/generate", dependencies=[Depends(require_key)])
+@app.post("/iso20022/generate", dependencies=[Depends(ops.require("simulate"))])
 def api_generate_iso20022(req: GenerateXMLRequest) -> Dict[str, Any]:
     try:
         payment = ISO20022Payment(
@@ -194,7 +185,7 @@ def api_generate_iso20022(req: GenerateXMLRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/settle", dependencies=[Depends(require_key)])
+@app.post("/settle", dependencies=[Depends(ops.require("simulate"))])
 def api_settle(req: SettleRequest) -> Dict[str, Any]:
     scenarios = {s["scenario_id"]: s for s in get_benchmark_scenarios()}
 
@@ -230,7 +221,7 @@ def api_settle(req: SettleRequest) -> Dict[str, Any]:
         if sc_id not in scenarios:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unknown scenario_id '{sc_id}'. Available: {sorted(scenarios.keys())}",
+                detail=f"Unknown scenario_id. Available: {sorted(scenarios.keys())}",
             )
         banks = scenarios[sc_id]["banks"]
         payments = scenarios[sc_id]["payments"]
@@ -250,11 +241,11 @@ def api_settle(req: SettleRequest) -> Dict[str, Any]:
 
     raise HTTPException(
         status_code=400,
-        detail=f"Unsupported engine '{req.engine}'. Expected 'fifo', 'bilateral', 'multilateral_lsm', or 'all'.",
+        detail="Unsupported engine. Expected 'fifo', 'bilateral', 'multilateral_lsm', or 'all'.",
     )
 
 
-@app.post("/stress", dependencies=[Depends(require_key)])
+@app.post("/stress", dependencies=[Depends(ops.require("simulate"))])
 def api_stress(req: StressRequest) -> Dict[str, Any]:
     try:
         custom_banks = (
@@ -293,6 +284,82 @@ def api_stress(req: StressRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/bench", dependencies=[Depends(require_key)])
+@app.get("/bench", dependencies=[Depends(ops.require("simulate"))])
 def api_bench() -> Dict[str, Any]:
     return run_all_benchmarks()
+
+
+class PositionsRequest(BaseModel):
+    participants: List[BankInput] = Field(..., min_length=1, max_length=MAX_BANKS)
+
+
+class EnqueueRequest(BaseModel):
+    payments: Optional[List[PaymentInput]] = Field(None, max_length=MAX_PAYMENTS)
+    xml: Optional[str] = Field(None, max_length=200_000, description="One pacs.008 or pacs.009 message")
+
+
+class RTGSSettleRequest(BaseModel):
+    engine: Literal["fifo", "bilateral", "multilateral_lsm"] = "multilateral_lsm"
+
+
+@app.put("/rtgs/participants")
+def put_participants(req: PositionsRequest, ident: dict = Depends(ops.require("positions"))) -> Dict[str, Any]:
+    try:
+        store.set_positions([BankNode(b.bic, b.name, b.opening_balance, b.reserve_floor) for b in req.participants])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    ops.log.info("positions set", extra={"fields": {"by": ident["user"] or "demo", "participants": len(req.participants)}})
+    return get_participants()
+
+
+@app.get("/rtgs/participants", dependencies=[Depends(ops.require("read"))])
+def get_participants() -> Dict[str, Any]:
+    # exact to the paisa (BankNode.to_dict rounds to two places for the console)
+    return {"participants": [{"bic": b.bic, "name": b.name, "opening_balance": format(b.opening_balance, "f"),
+                              "reserve_floor": format(b.reserve_floor, "f"),
+                              "available_liquidity": format(b.available_liquidity, "f")} for b in store.positions()]}
+
+
+@app.post("/rtgs/payments")
+def enqueue_payments(req: EnqueueRequest, ident: dict = Depends(ops.require("submit"))) -> Dict[str, Any]:
+    try:
+        if req.xml:
+            m = parse_iso20022_xml(req.xml)
+            if not m.msg_type.startswith(("pacs.008", "pacs.009")):
+                raise HTTPException(400, "only pacs.008 and pacs.009 messages can be queued")
+            items = [QueuedPayment(m.end_to_end_id, m.debtor_agent, m.creditor_agent, m.amount, m.priority, 0,
+                                   m.settlement_timestamp, m.msg_type, m.currency)]
+        elif req.payments:
+            items = [QueuedPayment(p.payment_id, p.sender, p.receiver, p.amount, p.priority, 0, p.timestamp, p.msg_type,
+                                   p.currency) for p in req.payments]
+        else:
+            raise HTTPException(400, "send payments or xml")
+        if len(store.payments("queued", MAX_QUEUE + 1)) + len(items) > MAX_QUEUE:
+            raise HTTPException(429, f"the queue holds at most {MAX_QUEUE} payments; settle it first")
+        store.enqueue(ident["user"] or "demo", items)
+    except DuplicatePayment as exc:
+        raise HTTPException(409, str(exc)) from None
+    except (ValueError, ISO20022ValidationError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    ops.DECISIONS.labels(decision="queued").inc(len(items))
+    return {"queued": [p.payment_id for p in items]}
+
+
+@app.get("/rtgs/payments", dependencies=[Depends(ops.require("read"))])
+def list_payments(status: Optional[Literal["queued", "settled"]] = None,
+                  limit: int = Query(500, ge=1, le=5000)) -> Dict[str, Any]:
+    rows = store.payments(status, limit)
+    return {"count": len(rows), "payments": rows}
+
+
+@app.post("/rtgs/settle")
+def settle_queue(req: RTGSSettleRequest, ident: dict = Depends(ops.require("settle"))) -> Dict[str, Any]:
+    out = store.settle(ident["user"] or "demo", req.engine)
+    ops.DECISIONS.labels(decision="settled").inc(out["settled_count"])
+    ops.DECISIONS.labels(decision="left_queued").inc(out["queued_count"] - out["settled_count"])
+    return out
+
+
+@app.get("/rtgs/runs", dependencies=[Depends(ops.require("read"))])
+def list_runs(limit: int = Query(50, ge=1, le=1000)) -> Dict[str, Any]:
+    return {"runs": store.runs(limit)}

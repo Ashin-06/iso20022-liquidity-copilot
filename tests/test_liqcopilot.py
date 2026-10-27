@@ -4,6 +4,8 @@ Comprehensive pytest suite for ISO 20022 RTGS Liquidity Copilot (`liqcopilot`).
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -179,7 +181,7 @@ def test_cycle_detection_and_multilateral_lsm_breaks_gridlock() -> None:
 
     assert fifo.volume_clearing_ratio < 0.20
     assert lsm.volume_clearing_ratio == pytest.approx(1.0)
-    assert lsm.peak_liquidity_used < 0.50 * fifo.peak_liquidity_used
+    assert lsm.peak_liquidity_used < Decimal("0.50") * fifo.peak_liquidity_used
     assert fifo.floor_violations == 0
     assert bilat.floor_violations == 0
     assert lsm.floor_violations == 0
@@ -290,7 +292,7 @@ def test_fastapi_endpoints() -> None:
 
     r_parse = client.post("/iso20022/parse", json={"xml": gen_data["xml"]})
     assert r_parse.status_code == 200
-    assert r_parse.json()["payment"]["amount"] == pytest.approx(500.0)
+    assert Decimal(r_parse.json()["payment"]["amount"]) == 500  # money is an exact decimal string
 
     r_settle = client.post(
         "/settle",
@@ -375,13 +377,17 @@ def test_lsm_reports_whether_its_answer_is_proven_optimal() -> None:
 
 
 def test_api_key_and_input_limits(monkeypatch) -> None:
+    import importlib
+    import json
+
     import liqcopilot.api as api
 
-    client = TestClient(app)
-    monkeypatch.setattr(api, "API_KEY", "s3cret")
+    monkeypatch.setenv("LIQCOPILOT_API_KEYS", json.dumps({"s3cret": {"user": "desk", "role": "analyst"}}))
+    api = importlib.reload(api)
+    client = TestClient(api.app)
     assert client.post("/settle", json={"scenario_id": "ring_4bank_classic"}).status_code == 401
     assert client.get("/bench").status_code == 401
-    assert client.get("/health").status_code == 200
+    assert client.get("/healthz").status_code == 200
 
     hdr = {"X-API-Key": "s3cret"}
     assert client.post("/settle", json={"scenario_id": "ring_4bank_classic"}, headers=hdr).status_code == 200

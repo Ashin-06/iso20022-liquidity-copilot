@@ -9,12 +9,15 @@ Supports:
 
 from __future__ import annotations
 
-import math
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
+
+from defusedxml import DefusedXmlException
+from defusedxml.ElementTree import fromstring as safe_fromstring
 
 NAMESPACES: Dict[str, str] = {
     "pacs.008.001.08": "urn:iso:std:iso:20022:tech:xsd:pacs.008.001.08",
@@ -48,7 +51,7 @@ class ISO20022Payment:
     end_to_end_id: str
     debtor_agent: str
     creditor_agent: str
-    amount: float
+    amount: Decimal
     currency: str = "INR"
     priority: str = "NORM"
     settlement_timestamp: str = "2026-10-22T09:15:00Z"
@@ -97,11 +100,11 @@ def validate_iso20022_payment(payment: ISO20022Payment) -> None:
     payment.debtor_agent = debtor
     payment.creditor_agent = creditor
 
-    if (
-        not isinstance(payment.amount, (int, float))
-        or not math.isfinite(payment.amount)
-        or payment.amount <= 0
-    ):
+    try:
+        payment.amount = as_money(payment.amount)
+    except ValueError as exc:
+        raise ISO20022ValidationError(str(exc)) from None
+    if payment.amount <= 0:
         raise ISO20022ValidationError(
             f"Settlement amount must be strictly positive (got {payment.amount})."
         )
@@ -128,7 +131,24 @@ def validate_iso20022_payment(payment: ISO20022Payment) -> None:
         ) from exc
 
 
-def _parse_amount(elem: ET.Element) -> tuple[float, str]:
+def as_money(value: Any) -> Decimal:
+    """An exact, finite decimal amount. Money is never float here: JSON numbers and other
+    floats go through str(), so 0.1 stays 0.1 rather than its binary expansion."""
+    if isinstance(value, bool):
+        raise ValueError("amount must be a number, not a boolean")
+    if isinstance(value, Decimal):
+        d = value
+    else:
+        try:
+            d = Decimal(str(value).strip())
+        except InvalidOperation:
+            raise ValueError("amount must be a decimal number") from None
+    if not d.is_finite():
+        raise ValueError("amount must be a finite number")
+    return d
+
+
+def _parse_amount(elem: ET.Element) -> tuple[Decimal, str]:
     """Read an ActiveCurrencyAndAmount element; the Ccy attribute is mandatory."""
     text = (elem.text or "").strip()
     if not AMOUNT_REGEX.match(text):
@@ -136,7 +156,7 @@ def _parse_amount(elem: ET.Element) -> tuple[float, str]:
     currency = elem.attrib.get("Ccy")
     if not currency:
         raise ISO20022ValidationError(f"Amount element {_strip_ns(elem.tag)} is missing its Ccy attribute.")
-    return float(text), currency
+    return Decimal(text), currency
 
 
 def _strip_ns(tag: str) -> str:
@@ -399,9 +419,11 @@ def parse_iso20022_xml(xml_str: str) -> ISO20022Payment:
         raise ISO20022ValidationError("DOCTYPE and ENTITY declarations are not allowed.")
 
     try:
-        doc = ET.fromstring(xml_str.strip())
+        doc = safe_fromstring(xml_str.strip())  # defusedxml: no entities, DTDs or external fetches
     except ET.ParseError as exc:
         raise ISO20022ValidationError(f"Malformed XML document: {exc}") from exc
+    except DefusedXmlException:
+        raise ISO20022ValidationError("DOCTYPE and ENTITY declarations are not allowed.") from None
 
     if _strip_ns(doc.tag) != "Document":
         raise ISO20022ValidationError(

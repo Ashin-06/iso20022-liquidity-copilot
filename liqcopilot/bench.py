@@ -10,6 +10,7 @@ Proves:
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, Dict, List
 
 from .gridlock import (
@@ -213,14 +214,14 @@ def run_all_benchmarks() -> Dict[str, Any]:
     scenarios = get_benchmark_scenarios()
     scenario_results: List[Dict[str, Any]] = []
 
-    total_queued_vol = 0.0
-    total_fifo_settled_vol = 0.0
-    total_bilat_settled_vol = 0.0
-    total_lsm_settled_vol = 0.0
+    total_queued_vol = Decimal(0)
+    total_fifo_settled_vol = Decimal(0)
+    total_bilat_settled_vol = Decimal(0)
+    total_lsm_settled_vol = Decimal(0)
 
-    total_fifo_peak_liq = 0.0
-    total_lsm_peak_liq = 0.0
-    total_gross_liq_needed = 0.0
+    total_fifo_peak_liq = Decimal(0)
+    total_lsm_peak_liq = Decimal(0)
+    total_gross_liq_needed = Decimal(0)
     total_floor_violations = 0
 
     for sc in scenarios:
@@ -280,15 +281,15 @@ def run_all_benchmarks() -> Dict[str, Any]:
             }
         )
 
-    fifo_overall_pct = (total_fifo_settled_vol / total_queued_vol) * 100.0
-    bilat_overall_pct = (total_bilat_settled_vol / total_queued_vol) * 100.0
-    lsm_overall_pct = (total_lsm_settled_vol / total_queued_vol) * 100.0
+    fifo_overall_pct = float(total_fifo_settled_vol / total_queued_vol) * 100.0
+    bilat_overall_pct = float(total_bilat_settled_vol / total_queued_vol) * 100.0
+    lsm_overall_pct = float(total_lsm_settled_vol / total_queued_vol) * 100.0
 
     peak_cut_vs_fifo_pct = (
-        (total_fifo_peak_liq - total_lsm_peak_liq) / max(total_fifo_peak_liq, 1e-6)
+        float(total_fifo_peak_liq - total_lsm_peak_liq) / max(float(total_fifo_peak_liq), 1e-6)
     ) * 100.0
     peak_cut_vs_gross_pct = (
-        (total_lsm_settled_vol - total_lsm_peak_liq) / max(total_lsm_settled_vol, 1e-6)
+        float(total_lsm_settled_vol - total_lsm_peak_liq) / max(float(total_lsm_settled_vol), 1e-6)
     ) * 100.0
 
     summary = {

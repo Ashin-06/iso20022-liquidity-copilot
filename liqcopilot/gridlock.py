@@ -14,12 +14,15 @@ Implements three settlement engines:
 
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .iso20022 import ISO20022Payment, generate_camt054_xml, validate_bic_or_ifsc
+from .iso20022 import ISO20022Payment, as_money, generate_camt054_xml, validate_bic_or_ifsc
+
+ZERO = Decimal(0)
+CENT = Decimal("0.01")
 
 PRIORITY_RANK: Dict[str, int] = {
     "URGT": 0,
@@ -38,24 +41,26 @@ class BankNode:
 
     bic: str
     name: str
-    opening_balance: float
-    reserve_floor: float
+    opening_balance: Decimal
+    reserve_floor: Decimal
 
     def __post_init__(self) -> None:
         self.bic = validate_bic_or_ifsc(self.bic)
-        if not (math.isfinite(self.opening_balance) and math.isfinite(self.reserve_floor)):
-            raise ValueError(f"Balance and floor must be finite numbers for {self.bic}.")
+        try:
+            self.opening_balance, self.reserve_floor = as_money(self.opening_balance), as_money(self.reserve_floor)
+        except ValueError:
+            raise ValueError(f"Balance and floor must be finite numbers for {self.bic}.") from None
         if self.reserve_floor < 0:
             raise ValueError(f"Reserve floor F_i must be non-negative (got {self.reserve_floor}).")
-        if self.opening_balance < self.reserve_floor - 1e-9:
+        if self.opening_balance < self.reserve_floor:
             raise ValueError(
                 f"Opening balance B_i ({self.opening_balance}) cannot be below "
                 f"reserve floor F_i ({self.reserve_floor}) for {self.bic}."
             )
 
     @property
-    def available_liquidity(self) -> float:
-        return max(0.0, self.opening_balance - self.reserve_floor)
+    def available_liquidity(self) -> Decimal:
+        return max(ZERO, self.opening_balance - self.reserve_floor)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,7 +79,7 @@ class QueuedPayment:
     payment_id: str
     sender: str
     receiver: str
-    amount: float
+    amount: Decimal
     priority: str = "NORM"
     arrival_order: int = 0
     timestamp: str = "2026-10-22T09:30:00Z"
@@ -86,7 +91,11 @@ class QueuedPayment:
         if self.priority not in PRIORITY_RANK:
             raise ValueError(f"Invalid priority '{self.priority}'.")
         # NaN slips through a plain `<= 0` check and then poisons every balance it touches
-        if not math.isfinite(self.amount) or self.amount <= 0:
+        try:
+            self.amount = as_money(self.amount)
+        except ValueError:
+            raise ValueError(f"Payment amount must be a positive finite number (got {self.amount!r}).") from None
+        if self.amount <= 0:
             raise ValueError(f"Payment amount must be a positive finite number (got {self.amount}).")
         self.sender = validate_bic_or_ifsc(self.sender)
         self.receiver = validate_bic_or_ifsc(self.receiver)
@@ -127,16 +136,16 @@ class SettlementResult:
     unsettled_payments: List[QueuedPayment]
     settled_count: int
     total_count: int
-    settled_volume: float
-    total_volume: float
+    settled_volume: Decimal
+    total_volume: Decimal
     volume_clearing_ratio: float
     count_clearing_ratio: float
-    opening_balances: Dict[str, float]
-    final_balances: Dict[str, float]
-    reserve_floors: Dict[str, float]
+    opening_balances: Dict[str, Decimal]
+    final_balances: Dict[str, Decimal]
+    reserve_floors: Dict[str, Decimal]
     floor_violations: int
-    peak_liquidity_used: float
-    gross_liquidity_needed: float
+    peak_liquidity_used: Decimal
+    gross_liquidity_needed: Decimal
     liquidity_savings_vs_gross_pct: float
     cycles_detected: int
     cycle_paths: List[List[str]] = field(default_factory=list)
@@ -233,8 +242,8 @@ def _build_settlement_result(
     all_payments: List[QueuedPayment],
     settled: List[QueuedPayment],
     unsettled: List[QueuedPayment],
-    final_balances: Dict[str, float],
-    peak_liquidity_used: float,
+    final_balances: Dict[str, Decimal],
+    peak_liquidity_used: Decimal,
     cycles: List[List[str]],
     audit_trail: List[Dict[str, Any]],
     generate_notifications: bool = True,
@@ -245,24 +254,24 @@ def _build_settlement_result(
     floor_violations = sum(
         1
         for bic, bal in final_balances.items()
-        if bal < reserve_floors[bic] - 1e-6
+        if bal < reserve_floors[bic]
     )
 
     settled_vol = sum(p.amount for p in settled)
     total_vol = sum(p.amount for p in all_payments)
-    vol_ratio = (settled_vol / total_vol) if total_vol > 0 else 1.0
+    vol_ratio = float(settled_vol / total_vol) if total_vol > 0 else 1.0
     cnt_ratio = (len(settled) / len(all_payments)) if all_payments else 1.0
 
     # Gross liquidity needed to settle all queued obligations without incoming offsets
-    gross_out_by_bank: Dict[str, float] = {b.bic: 0.0 for b in banks}
+    gross_out_by_bank: Dict[str, Decimal] = {b.bic: ZERO for b in banks}
     for p in all_payments:
-        gross_out_by_bank[p.sender] = gross_out_by_bank.get(p.sender, 0.0) + p.amount
+        gross_out_by_bank[p.sender] = gross_out_by_bank.get(p.sender, ZERO) + p.amount
     gross_liquidity_needed = sum(gross_out_by_bank.values())
 
     # Compare peak liquidity used vs gross outbound volume of settled payments
     gross_settled_vol = settled_vol if settled_vol > 0 else gross_liquidity_needed
     savings_pct = (
-        max(0.0, (1.0 - (peak_liquidity_used / gross_settled_vol)) * 100.0)
+        max(0.0, (1.0 - float(peak_liquidity_used / gross_settled_vol)) * 100.0)
         if gross_settled_vol > 0
         else 0.0
     )
@@ -309,26 +318,26 @@ def settle_fifo(
     B_sender - F_sender >= amount. Stalls when the head-of-line payment is blocked.
     """
     _check_network(banks, payments)
-    balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
-    floors: Dict[str, float] = {b.bic: float(b.reserve_floor) for b in banks}
-    opening: Dict[str, float] = dict(balances)
+    balances: Dict[str, Decimal] = {b.bic: b.opening_balance for b in banks}
+    floors: Dict[str, Decimal] = {b.bic: b.reserve_floor for b in banks}
+    opening: Dict[str, Decimal] = dict(balances)
 
     ordered = sorted(payments, key=lambda p: p.sort_key)
     settled: List[QueuedPayment] = []
     unsettled: List[QueuedPayment] = []
     audit_trail: List[Dict[str, Any]] = []
-    peak_system_drawdown = 0.0
+    peak_system_drawdown = ZERO
 
     if strict_global_hol:
         stalled = False
         for idx, p in enumerate(ordered):
             avail = balances[p.sender] - floors[p.sender]
-            if not stalled and avail + 1e-9 >= p.amount:
+            if not stalled and avail >= p.amount:
                 balances[p.sender] -= p.amount
                 balances[p.receiver] += p.amount
                 settled.append(p)
                 curr_drawdown = sum(
-                    max(0.0, opening[bic] - balances[bic]) for bic in balances
+                    max(ZERO, opening[bic] - balances[bic]) for bic in balances
                 )
                 peak_system_drawdown = max(peak_system_drawdown, curr_drawdown)
                 audit_trail.append(
@@ -374,14 +383,14 @@ def settle_fifo(
                     next_pending.append(p)
                     continue
                 avail = balances[p.sender] - floors[p.sender]
-                if avail + 1e-9 >= p.amount:
+                if avail >= p.amount:
                     step += 1
                     balances[p.sender] -= p.amount
                     balances[p.receiver] += p.amount
                     settled.append(p)
                     progress = True
                     curr_drawdown = sum(
-                        max(0.0, opening[bic] - balances[bic]) for bic in balances
+                        max(ZERO, opening[bic] - balances[bic]) for bic in balances
                     )
                     peak_system_drawdown = max(peak_system_drawdown, curr_drawdown)
                     audit_trail.append(
@@ -426,15 +435,15 @@ def settle_bilateral(
     gross settlement of unblocked head-of-line obligations.
     """
     _check_network(banks, payments)
-    balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
-    floors: Dict[str, float] = {b.bic: float(b.reserve_floor) for b in banks}
-    opening: Dict[str, float] = dict(balances)
+    balances: Dict[str, Decimal] = {b.bic: b.opening_balance for b in banks}
+    floors: Dict[str, Decimal] = {b.bic: b.reserve_floor for b in banks}
+    opening: Dict[str, Decimal] = dict(balances)
 
     ordered = sorted(payments, key=lambda p: p.sort_key)
     pending: List[QueuedPayment] = list(ordered)
     settled: List[QueuedPayment] = []
     audit_trail: List[Dict[str, Any]] = []
-    peak_system_drawdown = 0.0
+    peak_system_drawdown = ZERO
     step = 0
 
     progress = True
@@ -467,7 +476,7 @@ def settle_bilateral(
 
             # Try matching best non-empty prefix combinations (prioritizing head of queue)
             best_pair_batch: Optional[Tuple[List[QueuedPayment], List[QueuedPayment], float]] = None
-            best_vol = 0.0
+            best_vol = ZERO
 
             for i in range(1, len(ab_cand) + 1):
                 sub_ab = ab_cand[:i]
@@ -479,8 +488,8 @@ def settle_bilateral(
                     avail_a = balances[a] - floors[a]
                     avail_b = balances[b] - floors[b]
                     feasible = (
-                        (net_a_to_b >= 0 and avail_a + 1e-9 >= net_a_to_b)
-                        or (net_a_to_b < 0 and avail_b + 1e-9 >= -net_a_to_b)
+                        (net_a_to_b >= 0 and avail_a >= net_a_to_b)
+                        or (net_a_to_b < 0 and avail_b >= -net_a_to_b)
                     )
                     if feasible:
                         vol = sum_ab + sum_ba
@@ -497,7 +506,7 @@ def settle_bilateral(
                     settled_ids_in_round.add(p.payment_id)
                 step += 1
                 curr_drawdown = sum(
-                    max(0.0, opening[bic] - balances[bic]) for bic in balances
+                    max(ZERO, opening[bic] - balances[bic]) for bic in balances
                 )
                 peak_system_drawdown = max(peak_system_drawdown, curr_drawdown)
                 audit_trail.append(
@@ -520,14 +529,14 @@ def settle_bilateral(
         if pending:
             head = pending[0]
             avail = balances[head.sender] - floors[head.sender]
-            if avail + 1e-9 >= head.amount:
+            if avail >= head.amount:
                 balances[head.sender] -= head.amount
                 balances[head.receiver] += head.amount
                 settled.append(head)
                 pending.pop(0)
                 step += 1
                 curr_drawdown = sum(
-                    max(0.0, opening[bic] - balances[bic]) for bic in balances
+                    max(ZERO, opening[bic] - balances[bic]) for bic in balances
                 )
                 peak_system_drawdown = max(peak_system_drawdown, curr_drawdown)
                 audit_trail.append(
@@ -558,10 +567,10 @@ def settle_bilateral(
 
 
 def _evaluate_subset_feasibility(
-    avail_buffers: Dict[str, float],
+    avail_buffers: Dict[str, Decimal],
     payments: List[QueuedPayment],
     active_indices: Set[int],
-) -> Tuple[bool, Dict[str, float]]:
+) -> Tuple[bool, Dict[str, Decimal]]:
     """
     Compute net post-batch available buffer for each bank i:
     avail_i(S) = (B_i - F_i) + sum_{p in S, to=i} a_p - sum_{p in S, from=i} a_p
@@ -570,10 +579,10 @@ def _evaluate_subset_feasibility(
     post_avail = dict(avail_buffers)
     for idx in active_indices:
         p = payments[idx]
-        post_avail[p.sender] = post_avail.get(p.sender, 0.0) - p.amount
-        post_avail[p.receiver] = post_avail.get(p.receiver, 0.0) + p.amount
+        post_avail[p.sender] = post_avail.get(p.sender, ZERO) - p.amount
+        post_avail[p.receiver] = post_avail.get(p.receiver, ZERO) + p.amount
 
-    feasible = all(val >= -1e-7 for val in post_avail.values())
+    feasible = all(val >= 0 for val in post_avail.values())
     return feasible, post_avail
 
 
@@ -601,8 +610,8 @@ def settle_multilateral_lsm(
     _check_network(banks, payments)
     ordered = sorted(payments, key=lambda p: p.sort_key)
     n = len(ordered)
-    avail_buffers: Dict[str, float] = {
-        b.bic: float(b.opening_balance - b.reserve_floor) for b in banks
+    avail_buffers: Dict[str, Decimal] = {
+        b.bic: b.opening_balance - b.reserve_floor for b in banks
     }
     cycles = detect_payment_cycles(ordered)
     audit_trail: List[Dict[str, Any]] = []
@@ -637,10 +646,10 @@ def settle_multilateral_lsm(
             break
 
         # Prefer removing lower-priority payments whose amount best covers deficit_needed
-        def _prune_score(idx: int) -> Tuple[int, int, float, int]:
+        def _prune_score(idx: int, deficit_needed: Decimal = deficit_needed) -> Tuple[int, int, Decimal, int]:
             p = ordered[idx]
             pr_rank = PRIORITY_RANK[p.priority]
-            covers_deficit = 1 if p.amount >= deficit_needed - 1e-7 else 0
+            covers_deficit = 1 if p.amount >= deficit_needed else 0
             # Higher pr_rank (NORM=2 > URGT=0) pruned first; if covers_deficit, pick smallest overshoot
             overshoot = abs(p.amount - deficit_needed)
             return (-pr_rank, -covers_deficit, overshoot, -p.arrival_order)
@@ -670,7 +679,7 @@ def settle_multilateral_lsm(
             active = cand
 
     best_indices: Set[int] = set(active)
-    best_volume: float = sum(ordered[i].amount for i in best_indices)
+    best_volume: Decimal = sum(ordered[i].amount for i in best_indices)
 
     # Phase 3: Exact Branch-and-Bound for optimal subset S*
     node_visits = 0
@@ -682,23 +691,23 @@ def settle_multilateral_lsm(
             key=lambda i: (ordered[i].amount, -PRIORITY_RANK[ordered[i].priority]),
             reverse=True,
         )
-        suffix_rem = [0.0] * (n + 1)
+        suffix_rem = [ZERO] * (n + 1)
         for pos in range(n - 1, -1, -1):
             suffix_rem[pos] = suffix_rem[pos + 1] + ordered[search_order[pos]].amount
 
         # Maximum possible inflow to each bank from remaining items
-        rem_inflow: List[Dict[str, float]] = [{} for _ in range(n + 1)]
+        rem_inflow: List[Dict[str, Decimal]] = [{} for _ in range(n + 1)]
         for b in banks:
-            rem_inflow[n][b.bic] = 0.0
+            rem_inflow[n][b.bic] = ZERO
         for pos in range(n - 1, -1, -1):
             p = ordered[search_order[pos]]
             rem_inflow[pos] = dict(rem_inflow[pos + 1])
-            rem_inflow[pos][p.receiver] = rem_inflow[pos].get(p.receiver, 0.0) + p.amount
+            rem_inflow[pos][p.receiver] = rem_inflow[pos].get(p.receiver, ZERO) + p.amount
 
         def _dfs(
             pos: int,
-            curr_vol: float,
-            curr_avail: Dict[str, float],
+            curr_vol: Decimal,
+            curr_avail: Dict[str, Decimal],
             chosen: List[int],
         ) -> None:
             nonlocal best_volume, best_indices, node_visits
@@ -706,16 +715,16 @@ def settle_multilateral_lsm(
             if node_visits > max_visits:
                 return
 
-            if curr_vol + suffix_rem[pos] <= best_volume + 1e-7:
+            if curr_vol + suffix_rem[pos] <= best_volume:
                 return
 
             # Prune if any bank cannot recover its reserve floor even with all remaining inflows
             for bic, av in curr_avail.items():
-                if av + rem_inflow[pos].get(bic, 0.0) < -1e-7:
+                if av + rem_inflow[pos].get(bic, ZERO) < 0:
                     return
 
             if pos == n:
-                if curr_vol > best_volume + 1e-7:
+                if curr_vol > best_volume:
                     best_volume = curr_vol
                     best_indices = set(chosen)
                 return
@@ -735,7 +744,7 @@ def settle_multilateral_lsm(
             # Branch 2: Exclude payment idx
             _dfs(pos + 1, curr_vol, curr_avail, chosen)
 
-        _dfs(0, 0.0, dict(avail_buffers), [])
+        _dfs(0, ZERO, dict(avail_buffers), [])
 
     if n > EXACT_SEARCH_MAX_PAYMENTS:
         search = "heuristic only: exact search skipped above 28 payments"
@@ -745,7 +754,7 @@ def settle_multilateral_lsm(
         search = "exhaustive: proven optimal"
 
     # Phase 4: Execute Atomic Multilateral Batch Settlement
-    final_balances: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
+    final_balances: Dict[str, Decimal] = {b.bic: b.opening_balance for b in banks}
     settled: List[QueuedPayment] = []
     unsettled: List[QueuedPayment] = []
 
@@ -760,7 +769,7 @@ def settle_multilateral_lsm(
     # In an atomic multilateral LSM batch, all offsetting legs settle simultaneously;
     # the peak liquidity drawn from central bank reserves is the net batch drawdown.
     net_batch_drawdown = sum(
-        max(0.0, b.opening_balance - final_balances[b.bic]) for b in banks
+        max(ZERO, b.opening_balance - final_balances[b.bic]) for b in banks
     )
 
     audit_trail.append(
@@ -771,7 +780,7 @@ def settle_multilateral_lsm(
             "settled_volume": round(best_volume, 2),
             "net_liquidity_drawn": round(net_batch_drawdown, 2),
             "gross_to_net_compression_ratio": round(
-                best_volume / max(net_batch_drawdown, 1.0), 2
+                best_volume / max(net_batch_drawdown, Decimal(1)), 2
             ),
             "search": search,
             "proven_optimal": search.startswith("exhaustive"),
@@ -794,7 +803,7 @@ def settle_multilateral_lsm(
 def gross_sequential_peak(
     banks: List[BankNode],
     payments: List[QueuedPayment],
-) -> float:
+) -> Decimal:
     """
     Upper-bound liquidity need (Bech & Soramaki): the peak system-wide reserve drawdown
     required to settle `payments` one-by-one in FIFO priority/arrival order under pure
@@ -803,13 +812,13 @@ def gross_sequential_peak(
     For any payment set S, the atomic multilateral net drawdown of S is a point on this
     sequential path (its end state), so  net_drawdown(S) <= gross_sequential_peak(S).
     """
-    opening: Dict[str, float] = {b.bic: float(b.opening_balance) for b in banks}
-    balances: Dict[str, float] = dict(opening)
-    peak = 0.0
+    opening: Dict[str, Decimal] = {b.bic: b.opening_balance for b in banks}
+    balances: Dict[str, Decimal] = dict(opening)
+    peak = ZERO
     for p in sorted(payments, key=lambda q: q.sort_key):
-        balances[p.sender] = balances.get(p.sender, 0.0) - p.amount
-        balances[p.receiver] = balances.get(p.receiver, 0.0) + p.amount
-        draw = sum(max(0.0, opening.get(bic, 0.0) - bal) for bic, bal in balances.items())
+        balances[p.sender] = balances.get(p.sender, ZERO) - p.amount
+        balances[p.receiver] = balances.get(p.receiver, ZERO) + p.amount
+        draw = sum(max(ZERO, opening.get(bic, ZERO) - bal) for bic, bal in balances.items())
         peak = max(peak, draw)
     return peak
 
@@ -828,7 +837,7 @@ def compare_settlement_engines(
     # versus the LSM's atomic net batch drawdown.
     fifo_gross_peak_same_set = gross_sequential_peak(banks, lsm_res.settled_payments)
     if fifo_gross_peak_same_set > 0:
-        peak_cut_vs_fifo_pct = (
+        peak_cut_vs_fifo_pct = float(
             (fifo_gross_peak_same_set - lsm_res.peak_liquidity_used)
             / fifo_gross_peak_same_set
         ) * 100.0

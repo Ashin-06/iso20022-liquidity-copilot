@@ -18,8 +18,10 @@ Supports four stress scenarios:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from .iso20022 import as_money
 from .gridlock import (
     BankNode,
     QueuedPayment,
@@ -106,6 +108,12 @@ def _parse_hour(ts: str) -> int:
         return 12
 
 
+
+def _cr(x: float) -> Decimal:
+    """Crores computed by the cost model (floats) entering the settlement engines, which only take
+    exact amounts. The cost model itself (rates, haircuts, delay penalties) is an estimate and stays float."""
+    return as_money(x)
+
 def _default_intraday_network() -> tuple[List[BankNode], Dict[str, float], List[QueuedPayment]]:
     """
     Construct a realistic 6-bank wholesale Indian RTGS network with intraday schedule (09:00-17:30).
@@ -184,7 +192,7 @@ def optimize_collateral_vs_delay(
     def delay_cost(unsettled: List[QueuedPayment]) -> float:
         # One formula for every strategy, so the comparison is like for like
         return sum(
-            p.amount * (delay_cost_bps[p.priority] / 100.0) * max(2.0, 18.0 - _parse_hour(p.timestamp))
+            float(p.amount) * (delay_cost_bps[p.priority] / 100.0) * max(2.0, 18.0 - _parse_hour(p.timestamp))
             for p in unsettled
         )
 
@@ -200,7 +208,7 @@ def optimize_collateral_vs_delay(
 
     # 2. Naive full gross prefunding: cover each bank's gross outflows beyond its free buffer
     shortfall_cr = sum(
-        max(0.0, sum(p.amount for p in payments if p.sender == b.bic) - b.available_liquidity)
+        float(max(0, sum(p.amount for p in payments if p.sender == b.bic) - b.available_liquidity))
         for b in banks
     )
     naive_pledge_cr = shortfall_cr / max(effective_multiplier, 0.15)
@@ -214,7 +222,7 @@ def optimize_collateral_vs_delay(
             BankNode(
                 b.bic,
                 b.name,
-                opening_balance=b.opening_balance + per_bank_boost,
+                opening_balance=b.opening_balance + _cr(per_bank_boost),
                 reserve_floor=b.reserve_floor,
             )
             for b in banks
@@ -326,7 +334,7 @@ def simulate_bcbs248_stress(
                 BankNode(
                     b.bic,
                     b.name,
-                    opening_balance=b.opening_balance + credit_line * 0.25,
+                    opening_balance=b.opening_balance + _cr(credit_line * 0.25),
                     reserve_floor=b.reserve_floor,
                 )
             )
@@ -346,7 +354,7 @@ def simulate_bcbs248_stress(
                 BankNode(
                     b.bic,
                     b.name,
-                    opening_balance=b.opening_balance + credit_line * 0.30,
+                    opening_balance=b.opening_balance + _cr(credit_line * 0.30),
                     reserve_floor=b.reserve_floor,
                 )
             )
@@ -382,7 +390,7 @@ def simulate_bcbs248_stress(
         repo_rate_bps = 2.6
         for b in base_banks:
             # Banks hoard 35% of their free reserve buffer
-            hoarded_floor = b.reserve_floor + 0.35 * b.available_liquidity
+            hoarded_floor = b.reserve_floor + Decimal("0.35") * b.available_liquidity
             sim_banks.append(
                 BankNode(
                     b.bic,
@@ -421,7 +429,7 @@ def simulate_bcbs248_stress(
         repo_rate_bps = 3.5
         for b in base_banks:
             # Severe haircut contraction leaves banks with tightly constrained intraday buffer
-            shocked_floor = b.reserve_floor + 0.25 * b.available_liquidity
+            shocked_floor = b.reserve_floor + Decimal("0.25") * b.available_liquidity
             sim_banks.append(
                 BankNode(
                     b.bic,
@@ -434,7 +442,7 @@ def simulate_bcbs248_stress(
 
     free_reserves_sod = sum(b.available_liquidity for b in sim_banks)
     collateral_credit_sod = sum(
-        collateral_nominal.get(b.bic, 80.0) * (1.0 - haircut_pct / 100.0) for b in sim_banks
+        _cr(collateral_nominal.get(b.bic, 80.0) * (1.0 - haircut_pct / 100.0)) for b in sim_banks
     )
     available_liquidity_sod = free_reserves_sod + collateral_credit_sod
 
@@ -447,7 +455,7 @@ def simulate_bcbs248_stress(
     urgt_total = sum(p.amount for p in urgt_payments)
     lsm_settled_ids = {p.payment_id for p in lsm_full.settled_payments}
     urgt_settled_lsm = sum(p.amount for p in urgt_payments if p.payment_id in lsm_settled_ids)
-    urgt_settled_pct = (urgt_settled_lsm / urgt_total * 100.0) if urgt_total > 0 else 100.0
+    urgt_settled_pct = (float(urgt_settled_lsm / urgt_total) * 100.0) if urgt_total > 0 else 100.0
 
     # Compute hourly throughput schedule (10:00 through 18:00)
     hours = [10, 11, 12, 13, 14, 15, 16, 17, 18]
@@ -461,8 +469,8 @@ def simulate_bcbs248_stress(
         lsm_hr = settle_multilateral_lsm(sim_banks, arrived)
 
         label = f"{hr:02d}:00"
-        f_pct = round((fifo_hr.settled_volume / total_gross * 100.0) if total_gross > 0 else 0.0, 2)
-        l_pct = round((lsm_hr.settled_volume / total_gross * 100.0) if total_gross > 0 else 0.0, 2)
+        f_pct = round((float(fifo_hr.settled_volume / total_gross) * 100.0) if total_gross > 0 else 0.0, 2)
+        l_pct = round((float(lsm_hr.settled_volume / total_gross) * 100.0) if total_gross > 0 else 0.0, 2)
         throughput_fifo[label] = f_pct
         throughput_lsm[label] = l_pct
 
@@ -484,8 +492,8 @@ def simulate_bcbs248_stress(
     for b in sim_banks:
         gross_out = sum(p.amount for p in sim_payments if p.sender == b.bic)
         gross_in = sum(p.amount for p in sim_payments if p.receiver == b.bic)
-        fifo_draw = max(0.0, b.opening_balance - fifo_full.final_balances[b.bic])
-        lsm_draw = max(0.0, b.opening_balance - lsm_full.final_balances[b.bic])
+        fifo_draw = max(Decimal(0), b.opening_balance - fifo_full.final_balances[b.bic])
+        lsm_draw = max(Decimal(0), b.opening_balance - lsm_full.final_balances[b.bic])
         per_bank_metrics.append(
             {
                 "bic": b.bic,
@@ -498,7 +506,7 @@ def simulate_bcbs248_stress(
                 "fifo_net_drawdown_cr": round(fifo_draw, 2),
                 "lsm_net_drawdown_cr": round(lsm_draw, 2),
                 "final_balance_lsm_cr": round(lsm_full.final_balances[b.bic], 2),
-                "floor_respected": lsm_full.final_balances[b.bic] >= b.reserve_floor - 1e-6,
+                "floor_respected": lsm_full.final_balances[b.bic] >= b.reserve_floor,
             }
         )
 
@@ -507,7 +515,7 @@ def simulate_bcbs248_stress(
     daily_max_fifo = gross_sequential_peak(sim_banks, lsm_full.settled_payments)
     daily_max_lsm = lsm_full.peak_liquidity_used
     peak_reduction_pct = (
-        ((daily_max_fifo - daily_max_lsm) / daily_max_fifo * 100.0)
+        (float((daily_max_fifo - daily_max_lsm) / daily_max_fifo) * 100.0)
         if daily_max_fifo > 0
         else lsm_full.liquidity_savings_vs_gross_pct
     )
