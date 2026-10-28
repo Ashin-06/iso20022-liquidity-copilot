@@ -78,3 +78,7 @@ Multilateral netting needed ₹138 crore of liquidity, against ₹4,610 crore to
 - The code has not had an independent security review.
 
 See [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
