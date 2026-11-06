@@ -44,7 +44,7 @@ def _now() -> str:
 class RTGSStore:
     def __init__(self, engine: Engine):
         self.db = engine
-        self._lock = threading.Lock()  # ponytail: per process; a second replica could settle the same queue
+        self._lock = threading.Lock()  # Per process; a second replica could settle the same queue
 
     # --- positions -------------------------------------------------------------------
     def set_positions(self, banks: list[BankNode]) -> None:
