@@ -241,7 +241,7 @@
 
       let html = '<table><thead><tr><th>Scenario</th><th>FIFO %</th><th>Bilat %</th><th>LSM %</th><th>Viol</th></tr></thead><tbody>';
       for (const r of data.scenarios) {
-        html += `<tr><td>${esc(r.scenario_id)}</td><td>${r.fifo_cleared_pct}%</td><td>${r.bilateral_cleared_pct}%</td><td><b>${r.lsm_cleared_pct}%</b></td><td>${r.floor_violations}</td></tr>`;
+        html += `<tr><td>${esc(r.scenario_id)}</td><td>${esc(r.fifo_cleared_pct)}%</td><td>${esc(r.bilateral_cleared_pct)}%</td><td><b>${esc(r.lsm_cleared_pct)}%</b></td><td>${esc(r.floor_violations)}</td></tr>`;
       }
       html += '</tbody></table>';
       document.getElementById('benchTableContainer').innerHTML = html;
